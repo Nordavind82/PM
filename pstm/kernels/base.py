@@ -210,6 +210,10 @@ class KernelConfig:
     interpolation_method: str | None = None
     output_dt_ms: float | None = None
     accumulate_fold: bool = True
+
+    # Time-variant sampling
+    time_variant_enabled: bool = False
+    time_variant_windows: list | None = None  # List of TimeWindow objects
     
     def __post_init__(self):
         """Apply defaults from settings."""

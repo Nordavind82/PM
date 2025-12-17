@@ -549,6 +549,23 @@ class ExecutionStep(WizardStepWidget):
         # Check algorithm
         algo = self.controller.state.algorithm
         checks.append(f"✓ Algorithm: {algo.interpolation_method}, {algo.max_dip_degrees}° max dip")
+
+        # Check time-variant sampling
+        tv = algo.time_variant
+        if tv.enabled:
+            try:
+                from pstm.algorithm.time_variant import (
+                    FrequencyTimeTable, estimate_speedup,
+                )
+                times = [p[0] for p in tv.frequency_table]
+                freqs = [p[1] for p in tv.frequency_table]
+                freq_tbl = FrequencyTimeTable(times_ms=times, frequencies_hz=freqs)
+                speedup = estimate_speedup(og.t_min_ms, og.t_max_ms, og.dt_ms, freq_tbl)
+                checks.append(f"✓ Time-Variant: enabled (~{speedup:.1f}x speedup)")
+            except Exception:
+                checks.append("✓ Time-Variant: enabled")
+        else:
+            checks.append("○ Time-Variant: disabled")
         
         # Check output directory - read from UI directly (not yet saved to state)
         output_dir = self.output_dir_edit.text().strip()

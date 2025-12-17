@@ -17,6 +17,7 @@ BACKEND_STRING_MAP: dict[str, ComputeBackend] = {
     "numba_cpu": ComputeBackend.NUMBA_CPU,
     "mlx_metal": ComputeBackend.MLX_METAL,
     "metal_cpp": ComputeBackend.METAL_CPP,
+    "metal_compiled": ComputeBackend.METAL_COMPILED,
 }
 
 # Valid backend strings for validation messages

@@ -76,6 +76,7 @@ class ComputeBackend(str, Enum):
     NUMBA_CPU = "numba_cpu"
     MLX_METAL = "mlx_metal"
     METAL_CPP = "metal_cpp"
+    METAL_COMPILED = "metal_compiled"  # PyObjC + compiled .metallib (fastest on Apple Silicon)
 
 
 class OutputFormat(str, Enum):
@@ -390,6 +391,66 @@ class AntiAliasingConfig(BaseConfig):
         description="Maximum frequency (Hz)",
     )
 
+
+class TimeVariantConfig(BaseConfig):
+    """Configuration for time-variant sampling.
+
+    Allows coarser sampling at deeper times where high frequencies
+    are naturally attenuated, providing significant performance gains.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable time-variant sampling",
+    )
+    frequency_table: list[tuple[float, float]] = Field(
+        default_factory=lambda: [
+            (0.0, 80.0),
+            (1000.0, 50.0),
+            (2500.0, 30.0),
+            (5000.0, 20.0),
+        ],
+        description="List of (time_ms, max_freq_hz) pairs defining frequency vs time",
+    )
+    min_downsample_factor: PositiveInt = Field(
+        default=1,
+        description="Minimum downsample factor (1 = no downsampling)",
+    )
+    max_downsample_factor: PositiveInt = Field(
+        default=8,
+        description="Maximum downsample factor (power of 2)",
+    )
+
+    @field_validator("frequency_table")
+    @classmethod
+    def validate_frequency_table(cls, v: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        """Validate frequency table entries."""
+        if len(v) < 2:
+            raise ValueError("Frequency table must have at least 2 entries")
+
+        # Sort by time
+        v = sorted(v, key=lambda x: x[0])
+
+        # Check times are unique and increasing
+        times = [t for t, f in v]
+        if len(times) != len(set(times)):
+            raise ValueError("Times in frequency table must be unique")
+
+        # Check frequencies are positive
+        for t, f in v:
+            if f <= 0:
+                raise ValueError(f"Frequencies must be positive, got {f} at t={t}")
+
+        return v
+
+    @field_validator("max_downsample_factor")
+    @classmethod
+    def validate_max_downsample(cls, v: int) -> int:
+        """Ensure max downsample is power of 2."""
+        if v & (v - 1) != 0:
+            raise ValueError(f"max_downsample_factor must be power of 2, got {v}")
+        return v
+
     # Offset sectoring parameters
     offset_sectors: list[tuple[float, float]] | None = Field(
         default=None,
@@ -467,6 +528,7 @@ class AlgorithmConfig(BaseConfig):
     anti_aliasing: AntiAliasingConfig = Field(default_factory=AntiAliasingConfig)
     amplitude: AmplitudeConfig = Field(default_factory=AmplitudeConfig)
     mute: MuteConfig = Field(default_factory=MuteConfig)
+    time_variant: TimeVariantConfig = Field(default_factory=TimeVariantConfig)
 
 
 # =============================================================================

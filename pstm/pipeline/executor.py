@@ -808,6 +808,37 @@ class MigrationExecutor:
             output_dt_ms=self.config.output.grid.dt_ms,
         )
 
+        # Add time-variant sampling config if enabled
+        tv_config = self.config.algorithm.time_variant
+        if tv_config.enabled:
+            from pstm.algorithm.time_variant import (
+                FrequencyTimeTable, compute_time_windows, estimate_speedup,
+            )
+
+            times = [p[0] for p in tv_config.frequency_table]
+            freqs = [p[1] for p in tv_config.frequency_table]
+            freq_table = FrequencyTimeTable(times_ms=times, frequencies_hz=freqs)
+
+            windows = compute_time_windows(
+                t_min_ms=grid.t_min_ms,
+                t_max_ms=grid.t_max_ms,
+                base_dt_ms=grid.dt_ms,
+                freq_table=freq_table,
+                min_factor=tv_config.min_downsample_factor,
+                max_factor=tv_config.max_downsample_factor,
+            )
+
+            speedup = estimate_speedup(grid.t_min_ms, grid.t_max_ms, grid.dt_ms, freq_table)
+
+            kernel_config.time_variant_enabled = True
+            kernel_config.time_variant_windows = windows
+
+            self._debug.info(f"[TIME-VARIANT] Enabled with {len(windows)} windows, ~{speedup:.1f}x speedup")
+            for w in windows:
+                self._debug.debug(f"  Window: {w.t_start_ms:.0f}-{w.t_end_ms:.0f} ms, dt={w.dt_effective_ms:.1f}, factor={w.downsample_factor}")
+        else:
+            self._debug.info("[TIME-VARIANT] Disabled")
+
         grid = self.config.output.grid
         checkpoint_interval = self.config.execution.checkpoint.interval_tiles
 
@@ -1119,7 +1150,32 @@ class MigrationExecutor:
             psutil.cpu_percent(interval=None, percpu=True)  # Prime the pump
 
         kernel_start = time.time()
-        metrics = self._kernel.migrate_tile(traces, output_tile, velocity, kernel_config)
+
+        # Check for time-variant sampling
+        if kernel_config.time_variant_enabled and kernel_config.time_variant_windows:
+            # Use time-variant kernel if available
+            if hasattr(self._kernel, 'migrate_tile_time_variant'):
+                windows = kernel_config.time_variant_windows
+                self._debug.info(f"  Using TIME-VARIANT sampling with {len(windows)} windows")
+                print(f"  TIME-VARIANT: {len(windows)} windows, {sum(w.n_samples for w in windows)} samples", file=sys.stderr, flush=True)
+
+                metrics = self._kernel.migrate_tile_time_variant(
+                    traces, output_tile, velocity, kernel_config, windows
+                )
+
+                # Resample output back to uniform sampling
+                from pstm.algorithm.time_variant import resample_to_uniform
+                tv_image = output_tile.image
+                output_tile.image = resample_to_uniform(
+                    tv_image, windows, kernel_config.output_dt_ms or 2.0, output_tile.nt
+                )
+                self._debug.info(f"  Resampled time-variant output to uniform")
+            else:
+                self._debug.warning("  Time-variant requested but kernel doesn't support it, using uniform")
+                metrics = self._kernel.migrate_tile(traces, output_tile, velocity, kernel_config)
+        else:
+            metrics = self._kernel.migrate_tile(traces, output_tile, velocity, kernel_config)
+
         kernel_time = time.time() - kernel_start
 
         # Get CPU utilization during kernel (shows what happened during execution)

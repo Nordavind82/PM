@@ -161,7 +161,21 @@ class DataSelectionState:
     selected_traces: int = 0
 
 
-@dataclass 
+@dataclass
+class TimeVariantState:
+    """Time-variant sampling configuration."""
+    enabled: bool = False
+    frequency_table: list = field(default_factory=lambda: [
+        (0.0, 80.0),
+        (1000.0, 50.0),
+        (2500.0, 30.0),
+        (5000.0, 20.0),
+    ])
+    min_downsample_factor: int = 1
+    max_downsample_factor: int = 8
+
+
+@dataclass
 class AlgorithmState:
     """Migration algorithm parameters."""
     max_aperture_m: float = 5000.0
@@ -177,6 +191,7 @@ class AlgorithmState:
     phase_rotation: float = 0.0
     mute_above_ms: float = 0.0
     mute_below_ms: float = 10000.0
+    time_variant: TimeVariantState = field(default_factory=TimeVariantState)
 
 
 @dataclass
@@ -409,7 +424,15 @@ class WizardState:
                 ds["ovt_selected_tiles"] = [tuple(t) for t in ds["ovt_selected_tiles"]]
             state.data_selection = DataSelectionState(**ds)
         if "algorithm" in data:
-            state.algorithm = AlgorithmState(**data["algorithm"])
+            algo = data["algorithm"]
+            # Handle nested time_variant state
+            if "time_variant" in algo and isinstance(algo["time_variant"], dict):
+                tv = algo["time_variant"]
+                # Convert frequency_table lists back to tuples
+                if "frequency_table" in tv:
+                    tv["frequency_table"] = [tuple(p) for p in tv["frequency_table"]]
+                algo["time_variant"] = TimeVariantState(**tv)
+            state.algorithm = AlgorithmState(**algo)
         if "execution" in data:
             state.execution = ExecutionState(**data["execution"])
         if "output" in data:
@@ -1077,7 +1100,7 @@ class WizardController:
             CheckpointConfig, OutputProductsConfig, OutputFormat,
             ApertureConfig, AmplitudeConfig, InterpolationMethod,
             ExecutionConfig, ResourceConfig, ComputeBackend,
-            ColumnMapping,
+            ColumnMapping, TimeVariantConfig,
         )
 
         state = self.state
@@ -1144,10 +1167,20 @@ class WizardController:
             obliquity_factor=algo.apply_obliquity,
         )
 
+        # Build time-variant config from GUI state
+        tv = algo.time_variant
+        time_variant_config = TimeVariantConfig(
+            enabled=tv.enabled,
+            frequency_table=list(tv.frequency_table),
+            min_downsample_factor=tv.min_downsample_factor,
+            max_downsample_factor=tv.max_downsample_factor,
+        )
+
         algorithm_config = AlgorithmConfig(
             interpolation=interpolation,
             aperture=aperture_config,
             amplitude=amplitude_config,
+            time_variant=time_variant_config,
         )
         
         # Validate required fields - fail fast, no fallbacks

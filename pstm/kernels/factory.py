@@ -89,6 +89,20 @@ def _register_backends() -> None:
     except Exception as e:
         logger.debug(f"Metal C++ kernel not available: {e}")
 
+    # Compiled Metal (PyObjC + compiled .metallib - fastest on Apple Silicon)
+    try:
+        from pstm.kernels.metal_compiled import CompiledMetalKernel, check_metal_available
+
+        if check_metal_available():
+            _BACKEND_REGISTRY[ComputeBackend.METAL_COMPILED] = CompiledMetalKernel
+            logger.debug("Registered Compiled Metal kernel (PyObjC)")
+        else:
+            logger.debug("Compiled Metal kernel: Metal not available on this system")
+    except ImportError as e:
+        logger.debug(f"Compiled Metal kernel not available: {e}")
+    except Exception as e:
+        logger.debug(f"Compiled Metal kernel not available: {e}")
+
 
 def get_available_backends() -> list[ComputeBackend]:
     """
@@ -170,9 +184,10 @@ def select_best_backend() -> ComputeBackend:
     """
     Select the best available backend.
 
-    Priority: Metal C++ > Numba CPU > MLX Metal > NumPy
+    Priority: Compiled Metal > Metal C++ > Numba CPU > MLX Metal > NumPy
 
-    Note: Metal C++ is preferred on Apple Silicon for best GPU performance.
+    Note: Compiled Metal (PyObjC) is the fastest on Apple Silicon with native
+    Metal compute shaders. Metal C++ is the fallback GPU option.
     Numba CPU is preferred over MLX Metal because:
     - Numba's parallel JIT releases the GIL, allowing UI updates
     - MLX kernel currently uses Python for loops which are slow and block the GIL
@@ -184,8 +199,9 @@ def select_best_backend() -> ComputeBackend:
     if not _BACKEND_REGISTRY:
         _register_backends()
 
-    # Priority order - Metal C++ first for GPU, then Numba for CPU
+    # Priority order - Compiled Metal first (fastest GPU), then Metal C++, then Numba for CPU
     priority = [
+        ComputeBackend.METAL_COMPILED,
         ComputeBackend.METAL_CPP,
         ComputeBackend.NUMBA_CPU,
         ComputeBackend.MLX_METAL,
