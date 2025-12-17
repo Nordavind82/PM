@@ -1,0 +1,4 @@
+survey_size_km,n_traces,n_midpoints,data_size_mb,generation_s,export_s,header_load_s,spatial_index_s,aperture_query_s,trace_load_s,kernel_init_s,single_tile_s,traces_per_tile,traces_per_s,n_tiles_total,estimated_total_s
+1,6724,1681,38.50,0.553,0.600,0.0348,0.0008,0.000088,0.0323,0.0002,0.108,6724,62233.0,1,0.1
+2,26244,6561,150.27,2.134,0.065,0.0016,0.0026,0.000234,0.1084,0.0001,0.340,26244,77263.4,4,1.4
+5,161604,40401,925.32,13.103,0.359,0.0047,0.0203,0.001106,0.4373,0.0001,0.961,100000,104022.8,36,34.6

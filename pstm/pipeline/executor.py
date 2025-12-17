@@ -1,0 +1,1221 @@
+"""
+Migration executor for PSTM.
+
+Orchestrates the complete migration pipeline.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+import polars as pl
+import zarr
+from numpy.typing import NDArray
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+from pstm.config.models import MigrationConfig
+
+
+def get_cpu_info() -> dict:
+    """Get CPU utilization info for profiling."""
+    if not HAS_PSUTIL:
+        return {"available": False}
+
+    try:
+        # Get per-CPU utilization (non-blocking with interval=None uses cached value)
+        per_cpu = psutil.cpu_percent(interval=None, percpu=True)
+        overall = psutil.cpu_percent(interval=None)
+
+        # Count cores at various utilization levels
+        active_cores = sum(1 for c in per_cpu if c > 50)
+        busy_cores = sum(1 for c in per_cpu if c > 90)
+
+        return {
+            "available": True,
+            "overall_percent": overall,
+            "per_cpu": per_cpu,
+            "n_cores": len(per_cpu),
+            "active_cores": active_cores,  # >50% utilization
+            "busy_cores": busy_cores,  # >90% utilization
+        }
+    except Exception:
+        return {"available": False}
+
+
+def setup_debug_logging(output_dir: Path | None = None) -> logging.Logger:
+    """Setup comprehensive debug logging to console and file."""
+    # Create a specific logger for migration debugging
+    debug_logger = logging.getLogger("pstm.migration.debug")
+    debug_logger.setLevel(logging.DEBUG)
+    debug_logger.handlers.clear()  # Clear existing handlers
+
+    # Console handler with detailed format
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG)
+    console_format = logging.Formatter(
+        '[%(asctime)s.%(msecs)03d] %(levelname)-8s %(name)s:%(lineno)d - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    console_handler.setFormatter(console_format)
+    debug_logger.addHandler(console_handler)
+
+    # File handler if output_dir provided
+    if output_dir:
+        log_file = output_dir / f"migration_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.DEBUG)
+        file_format = logging.Formatter(
+            '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(file_format)
+        debug_logger.addHandler(file_handler)
+        debug_logger.info(f"Debug log file: {log_file}")
+
+    return debug_logger
+
+
+def get_system_info() -> dict:
+    """Get system information for debugging."""
+    info = {
+        "platform": sys.platform,
+        "python_version": sys.version,
+        "cpu_count": os.cpu_count(),
+    }
+
+    # Memory info
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        info["total_memory_gb"] = round(mem.total / (1024**3), 2)
+        info["available_memory_gb"] = round(mem.available / (1024**3), 2)
+        info["used_memory_percent"] = mem.percent
+    except ImportError:
+        info["memory_info"] = "psutil not installed"
+
+    # NumPy info
+    info["numpy_version"] = np.__version__
+
+    # Check for compute backends
+    try:
+        import numba
+        info["numba_version"] = numba.__version__
+        info["numba_available"] = True
+    except ImportError:
+        info["numba_available"] = False
+
+    try:
+        import mlx.core as mx
+        info["mlx_available"] = True
+        # Try to get Metal device info
+        try:
+            info["mlx_default_device"] = str(mx.default_device())
+        except:
+            pass
+    except ImportError:
+        info["mlx_available"] = False
+
+    return info
+
+
+def log_memory_state(debug_logger: logging.Logger, context: str = ""):
+    """Log current memory state."""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        process = psutil.Process()
+        proc_mem = process.memory_info()
+        debug_logger.debug(
+            f"MEMORY [{context}] System: {mem.available / (1024**3):.2f} GB available "
+            f"({mem.percent}% used) | Process RSS: {proc_mem.rss / (1024**3):.3f} GB"
+        )
+    except ImportError:
+        debug_logger.debug(f"MEMORY [{context}] psutil not available for memory tracking")
+
+
+from pstm.data import (
+    MemmapManager,
+    ParquetHeaderManager,
+    SpatialIndex,
+    ZarrTraceReader,
+    create_velocity_model,
+    query_traces_for_tile,
+)
+from pstm.data.velocity_model import VelocityManager, create_velocity_manager
+from pstm.kernels.base import (
+    KernelConfig,
+    KernelMetrics,
+    OutputTile,
+    TraceBlock,
+    VelocitySlice,
+    create_output_tile,
+    create_trace_block,
+)
+from pstm.kernels.factory import create_kernel
+from pstm.pipeline.checkpoint import CheckpointHandler, should_checkpoint
+from pstm.pipeline.tile_planner import TilePlan, TilePlanner, TileSpec, iter_tiles
+from pstm.utils.logging import get_logger, print_metric, print_section, print_success
+from pstm.utils.units import format_bytes, format_duration
+
+logger = get_logger(__name__)
+
+
+class ExecutionPhase(Enum):
+    """Migration execution phases."""
+
+    INIT = "initialization"
+    PLANNING = "planning"
+    MIGRATION = "migration"
+    FINALIZATION = "finalization"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+@dataclass
+class ExecutionMetrics:
+    """Accumulated execution metrics."""
+
+    start_time: float = 0.0
+    end_time: float = 0.0
+
+    n_tiles_total: int = 0
+    n_tiles_completed: int = 0
+    n_traces_processed: int = 0  # Input traces processed (for rate calculation)
+    n_samples_output: int = 0
+    n_output_bins_completed: int = 0  # Output bins (pillars) fully migrated
+    total_output_bins: int = 0  # Total output bins = nx * ny
+
+    compute_time_total: float = 0.0
+    io_time_total: float = 0.0
+
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def elapsed_time(self) -> float:
+        """Total elapsed time."""
+        if self.end_time > 0:
+            return self.end_time - self.start_time
+        return time.time() - self.start_time
+
+    @property
+    def progress_fraction(self) -> float:
+        """Completion progress as fraction."""
+        if self.n_tiles_total == 0:
+            return 0.0
+        return self.n_tiles_completed / self.n_tiles_total
+
+    @property
+    def traces_per_second(self) -> float:
+        """Average processing rate."""
+        if self.compute_time_total > 0:
+            return self.n_traces_processed / self.compute_time_total
+        return 0.0
+
+    def estimate_remaining_time(self) -> float:
+        """Estimate remaining time in seconds."""
+        if self.n_tiles_completed == 0:
+            return 0.0
+        time_per_tile = self.elapsed_time / self.n_tiles_completed
+        remaining_tiles = self.n_tiles_total - self.n_tiles_completed
+        return time_per_tile * remaining_tiles
+
+
+@dataclass
+class ProgressInfo:
+    """Detailed progress information passed to callback."""
+    phase: ExecutionPhase
+    current_tile: int
+    total_tiles: int
+    message: str
+    traces_processed: int = 0  # Input traces (for rate display)
+    traces_in_tile: int = 0  # Input traces in current tile
+    tile_x: int = 0
+    tile_y: int = 0
+    total_traces: int = 0  # Total input traces in dataset
+    # Output progress (what matters for completion)
+    output_bins_completed: int = 0  # Output bins fully migrated
+    total_output_bins: int = 0  # Total output bins = nx * ny
+    output_bins_in_tile: int = 0  # Output bins in current tile
+
+
+# Type for progress callback - accepts ProgressInfo
+ProgressCallback = Callable[[ProgressInfo], None]
+
+
+class MigrationExecutor:
+    """
+    Main executor for 3D PSTM migration.
+
+    Orchestrates:
+    1. Initialization (data loading, index building)
+    2. Tile planning
+    3. Migration loop
+    4. Finalization (normalization, output writing)
+    """
+
+    def __init__(
+        self,
+        config: MigrationConfig,
+        progress_callback: ProgressCallback | None = None,
+    ):
+        """
+        Initialize the executor.
+
+        Args:
+            config: Migration configuration
+            progress_callback: Optional callback for progress updates
+        """
+        self.config = config
+        self.progress_callback = progress_callback
+
+        # Setup debug logging
+        self._debug = setup_debug_logging(config.output.output_dir)
+        self._debug.info("=" * 70)
+        self._debug.info("PSTM MIGRATION EXECUTOR INITIALIZED")
+        self._debug.info("=" * 70)
+
+        # Log system info
+        sys_info = get_system_info()
+        self._debug.info("SYSTEM INFORMATION:")
+        for key, value in sys_info.items():
+            self._debug.info(f"  {key}: {value}")
+
+        # Log configuration
+        self._debug.info("CONFIGURATION:")
+        self._debug.info(f"  Config name: {config.name}")
+        self._debug.info(f"  Input traces: {config.input.traces_path}")
+        self._debug.info(f"  Input headers: {config.input.headers_path}")
+        self._debug.info(f"  Output dir: {config.output.output_dir}")
+        self._debug.info(f"  Backend requested: {config.execution.resources.backend}")
+        self._debug.info(f"  Max memory: {config.execution.resources.max_memory_gb} GB")
+        self._debug.info(f"  Output grid: {config.output.grid.nx}x{config.output.grid.ny}x{config.output.grid.nt}")
+
+        log_memory_state(self._debug, "init")
+
+        # State
+        self.phase = ExecutionPhase.INIT
+        self.metrics = ExecutionMetrics()
+
+        # Resources (initialized during run)
+        self._trace_reader: ZarrTraceReader | None = None
+        self._header_manager: ParquetHeaderManager | None = None
+        self._spatial_index: SpatialIndex | None = None
+        self._velocity_manager: VelocityManager | None = None
+        self._kernel = None
+        self._memmap_manager: MemmapManager | None = None
+        self._checkpoint: CheckpointHandler | None = None
+        self._tile_plan: TilePlan | None = None
+
+        # Control flags
+        self._pause_requested = False
+        self._stop_requested = False
+
+    def run(self, resume: bool = False) -> bool:
+        """
+        Execute the migration.
+
+        Args:
+            resume: Attempt to resume from checkpoint
+
+        Returns:
+            True if completed successfully
+        """
+        self._debug.info("=" * 70)
+        self._debug.info("STARTING MIGRATION RUN")
+        self._debug.info(f"  Resume mode: {resume}")
+        self._debug.info("=" * 70)
+
+        self.metrics.start_time = time.time()
+
+        try:
+            # Phase 1: Initialization
+            self._debug.info(">>> PHASE 1: INITIALIZATION <<<")
+            log_memory_state(self._debug, "before_init")
+            self._report_phase(ExecutionPhase.INIT)
+            self._initialize()
+            log_memory_state(self._debug, "after_init")
+
+            # Phase 2: Planning
+            self._debug.info(">>> PHASE 2: PLANNING <<<")
+            log_memory_state(self._debug, "before_plan")
+            self._report_phase(ExecutionPhase.PLANNING)
+            self._plan(resume)
+            log_memory_state(self._debug, "after_plan")
+
+            # Phase 3: Migration
+            self._debug.info(">>> PHASE 3: MIGRATION <<<")
+            log_memory_state(self._debug, "before_migrate")
+            self._report_phase(ExecutionPhase.MIGRATION)
+            self._migrate()
+            log_memory_state(self._debug, "after_migrate")
+
+            # Phase 4: Finalization
+            self._debug.info(">>> PHASE 4: FINALIZATION <<<")
+            log_memory_state(self._debug, "before_finalize")
+            self._report_phase(ExecutionPhase.FINALIZATION)
+            self._finalize()
+            log_memory_state(self._debug, "after_finalize")
+
+            # Done
+            self._report_phase(ExecutionPhase.COMPLETE)
+            self.metrics.end_time = time.time()
+
+            self._debug.info("=" * 70)
+            self._debug.info("MIGRATION COMPLETED SUCCESSFULLY")
+            self._debug.info(f"  Total time: {self.metrics.elapsed_time:.2f} seconds")
+            self._debug.info("=" * 70)
+
+            self._print_summary()
+            return True
+
+        except KeyboardInterrupt:
+            self._debug.warning("Migration interrupted by user (KeyboardInterrupt)")
+            logger.info("Migration interrupted by user")
+            self._save_checkpoint()
+            return False
+
+        except Exception as e:
+            self._debug.error("=" * 70)
+            self._debug.error("MIGRATION FAILED WITH EXCEPTION")
+            self._debug.error(f"  Exception type: {type(e).__name__}")
+            self._debug.error(f"  Exception message: {e}")
+            self._debug.error("  Full traceback:")
+            for line in traceback.format_exc().split('\n'):
+                self._debug.error(f"    {line}")
+            self._debug.error("=" * 70)
+            log_memory_state(self._debug, "at_failure")
+
+            logger.exception(f"Migration failed: {e}")
+            print(f"\nMigration failed: {e}")
+            print(f"Traceback (most recent call last):")
+            traceback.print_exc()
+
+            self._report_phase(ExecutionPhase.FAILED)
+            self._save_checkpoint()
+            return False
+
+        finally:
+            self._cleanup()
+
+    def request_pause(self) -> None:
+        """Request migration to pause (will pause after current tile)."""
+        self._pause_requested = True
+
+    def request_stop(self) -> None:
+        """Request migration to stop (will stop after current tile)."""
+        self._stop_requested = True
+
+    def _report_phase(self, phase: ExecutionPhase) -> None:
+        """Report phase change."""
+        self.phase = phase
+        print_section(f"Phase: {phase.value.title()}")
+        if self.progress_callback:
+            # Get total traces if reader is initialized
+            total_traces = self._trace_reader.n_traces if self._trace_reader else 0
+            info = ProgressInfo(
+                phase=phase,
+                current_tile=0,
+                total_tiles=0,
+                message="",
+                traces_processed=self.metrics.n_traces_processed,
+                total_traces=total_traces,
+                output_bins_completed=self.metrics.n_output_bins_completed,
+                total_output_bins=self.metrics.total_output_bins,
+            )
+            self.progress_callback(info)
+
+    def _report_progress(
+        self,
+        current: int,
+        total: int,
+        message: str = "",
+        traces_in_tile: int = 0,
+        tile_x: int = 0,
+        tile_y: int = 0,
+    ) -> None:
+        """Report progress within current phase."""
+        self._debug.info(f"EXECUTOR._report_progress called:")
+        self._debug.info(f"  current={current}, total={total}, traces_in_tile={traces_in_tile}")
+        self._debug.info(f"  traces_processed={self.metrics.n_traces_processed}")
+        self._debug.info(f"  message='{message}'")
+        self._debug.info(f"  has callback: {self.progress_callback is not None}")
+
+        if self.progress_callback:
+            # Get total traces if reader is initialized
+            total_traces = self._trace_reader.n_traces if self._trace_reader else 0
+            # Calculate output bins in current tile (for display)
+            output_bins_in_tile = 0
+            if self._tile_plan and current < len(self._tile_plan.tiles):
+                tile = self._tile_plan.tiles[current]
+                output_bins_in_tile = tile.nx * tile.ny
+            info = ProgressInfo(
+                phase=self.phase,
+                current_tile=current,
+                total_tiles=total,
+                message=message,
+                traces_processed=self.metrics.n_traces_processed,
+                traces_in_tile=traces_in_tile,
+                tile_x=tile_x,
+                tile_y=tile_y,
+                total_traces=total_traces,
+                output_bins_completed=self.metrics.n_output_bins_completed,
+                total_output_bins=self.metrics.total_output_bins,
+                output_bins_in_tile=output_bins_in_tile,
+            )
+            self._debug.info(f"  Calling progress_callback with ProgressInfo...")
+            self.progress_callback(info)
+            self._debug.info(f"  progress_callback returned")
+
+    def _initialize(self) -> None:
+        """Initialize all resources."""
+        self._debug.info("--- Initialization: Opening input data ---")
+        logger.info("Opening input data...")
+
+        # Open trace reader
+        self._debug.debug(f"Opening trace reader: {self.config.input.traces_path}")
+        self._trace_reader = ZarrTraceReader(
+            self.config.input.traces_path,
+            sample_rate_ms=self.config.input.sample_rate_ms,
+            start_time_ms=self.config.input.start_time_ms,
+        )
+        self._trace_reader.open()
+        self._debug.info(f"Trace reader opened: {self._trace_reader.n_traces} traces, {self._trace_reader.n_samples} samples")
+
+        # Open header manager
+        self._debug.debug(f"Opening header manager: {self.config.input.headers_path}")
+        self._header_manager = ParquetHeaderManager(
+            self.config.input.headers_path,
+            column_mapping=self.config.input.columns,
+            apply_scalar=self.config.input.apply_coord_scalar,
+        )
+        self._header_manager.open()
+        self._debug.info(f"Header manager opened: {self._header_manager.n_traces} headers")
+
+        self._debug.info("--- Initialization: Building spatial index ---")
+        log_memory_state(self._debug, "before_spatial_index")
+        logger.info("Building spatial index...")
+        # Build or load spatial index
+        if self.config.geometry.index_path and self.config.geometry.index_path.exists():
+            self._debug.debug(f"Loading existing spatial index: {self.config.geometry.index_path}")
+            self._spatial_index = SpatialIndex.load(self.config.geometry.index_path)
+        else:
+            self._debug.debug("Building new spatial index from midpoints...")
+            trace_indices, midpoint_x, midpoint_y = self._header_manager.get_all_midpoints()
+            self._spatial_index = SpatialIndex.build(trace_indices, midpoint_x, midpoint_y)
+        self._debug.info(f"Spatial index ready: {self._spatial_index.n_points} entries")
+        log_memory_state(self._debug, "after_spatial_index")
+
+        self._debug.info("--- Initialization: Loading velocity model ---")
+        logger.info("Loading velocity model...")
+        # Load velocity model with manager for tile extraction
+        self._debug.debug(f"Velocity source: {self.config.velocity.source}")
+        self._velocity_manager = create_velocity_manager(
+            self.config.velocity,
+            self.config.output.grid,
+        )
+        if self._velocity_manager.memory_usage_gb > 0:
+            self._debug.info(f"Velocity grid memory: {self._velocity_manager.memory_usage_gb:.2f} GB")
+            logger.info(f"Velocity grid memory: {self._velocity_manager.memory_usage_gb:.2f} GB")
+        log_memory_state(self._debug, "after_velocity")
+
+        self._debug.info("--- Initialization: Creating compute kernel ---")
+        logger.info("Initializing compute kernel...")
+        # Initialize kernel
+        backend = self.config.execution.resources.backend.value
+        self._debug.info(f"KERNEL BACKEND REQUESTED: {backend}")
+        self._debug.debug(f"Backend enum value: {self.config.execution.resources.backend}")
+
+        self._kernel = create_kernel(backend)
+        self._debug.info(f"KERNEL CREATED: {type(self._kernel).__name__}")
+        self._debug.info(f"  Kernel class: {type(self._kernel).__module__}.{type(self._kernel).__name__}")
+
+        kernel_config = KernelConfig(
+            max_aperture_m=self.config.algorithm.aperture.max_aperture_m,
+            min_aperture_m=self.config.algorithm.aperture.min_aperture_m,
+            max_dip_degrees=self.config.algorithm.aperture.max_dip_degrees,
+            taper_fraction=self.config.algorithm.aperture.taper_fraction,
+            apply_spreading=self.config.algorithm.amplitude.geometrical_spreading,
+            apply_obliquity=self.config.algorithm.amplitude.obliquity_factor,
+            interpolation_method=self.config.algorithm.interpolation.value,
+            output_dt_ms=self.config.output.grid.dt_ms,
+        )
+        self._debug.debug(f"Kernel config: aperture={kernel_config.max_aperture_m}m, dip={kernel_config.max_dip_degrees}deg")
+        self._kernel.initialize(kernel_config)
+        self._debug.info("Kernel initialized successfully")
+
+        logger.info("Setting up memory manager...")
+        # Set up memmap manager
+        work_dir = self.config.output.output_dir / ".work"
+        self._memmap_manager = MemmapManager(work_dir)
+
+        # Create output accumulator
+        grid = self.config.output.grid
+        self._memmap_manager.create(
+            "image",
+            shape=(grid.nx, grid.ny, grid.nt),
+            dtype=np.float64,
+            fill_value=0.0,
+        )
+        self._memmap_manager.create(
+            "fold",
+            shape=(grid.nx, grid.ny),
+            dtype=np.int32,
+            fill_value=0,
+        )
+
+        # Create header accumulators for CIG support
+        # These accumulate offset/azimuth per bin for later sorting
+        self._memmap_manager.create(
+            "trace_count",  # Count of traces per bin (independent of kernel fold)
+            shape=(grid.nx, grid.ny),
+            dtype=np.int32,
+            fill_value=0,
+        )
+        self._memmap_manager.create(
+            "offset_sum",
+            shape=(grid.nx, grid.ny),
+            dtype=np.float64,
+            fill_value=0.0,
+        )
+        self._memmap_manager.create(
+            "azimuth_sin_sum",  # For circular mean: sum of sin(azimuth)
+            shape=(grid.nx, grid.ny),
+            dtype=np.float64,
+            fill_value=0.0,
+        )
+        self._memmap_manager.create(
+            "azimuth_cos_sum",  # For circular mean: sum of cos(azimuth)
+            shape=(grid.nx, grid.ny),
+            dtype=np.float64,
+            fill_value=0.0,
+        )
+
+        print_success("Initialization complete")
+
+    def _plan(self, resume: bool) -> None:
+        """Plan tile processing."""
+        grid = self.config.output.grid
+
+        # Create tile planner
+        planner = TilePlanner(
+            output_grid=grid,
+            tiling_config=self.config.execution.tiling,
+            max_memory_gb=self.config.execution.resources.max_memory_gb,
+            aperture_radius=self.config.algorithm.aperture.max_aperture_m,
+        )
+
+        self._tile_plan = planner.plan()
+        self.metrics.n_tiles_total = self._tile_plan.n_tiles
+        self.metrics.n_samples_output = self._tile_plan.total_output_samples
+        # Total output bins = nx * ny (each bin is a fully migrated output trace)
+        self.metrics.total_output_bins = grid.nx * grid.ny
+
+        # Set up checkpoint handler
+        checkpoint_dir = (
+            self.config.execution.checkpoint.checkpoint_dir
+            or self.config.output.output_dir / ".checkpoint"
+        )
+        self._checkpoint = CheckpointHandler(
+            checkpoint_dir=checkpoint_dir,
+            config=self.config,
+            total_tiles=self._tile_plan.n_tiles,
+        )
+
+        # Try to resume if requested
+        if resume and self._checkpoint.exists():
+            state = self._checkpoint.load()
+            if state:
+                self.metrics.n_tiles_completed = state.n_completed
+                self.metrics.n_traces_processed = state.total_traces_processed
+                self.metrics.compute_time_total = state.total_compute_time_s
+                logger.info(f"Resuming from checkpoint: {state.n_completed} tiles completed")
+
+        print_metric("Total tiles", self._tile_plan.n_tiles)
+        print_metric("Output samples", f"{self.metrics.n_samples_output:,}")
+        print_metric("Output size", format_bytes(grid.size_gb * 1024**3))
+
+    def _migrate(self) -> None:
+        """Execute migration loop over tiles."""
+        self._debug.info("--- Migration: Starting tile processing loop ---")
+        assert self._tile_plan is not None
+        assert self._checkpoint is not None
+        assert self._spatial_index is not None
+        assert self._trace_reader is not None
+        assert self._header_manager is not None
+        assert self._velocity_manager is not None
+        assert self._kernel is not None
+        assert self._memmap_manager is not None
+
+        # Get arrays
+        image = self._memmap_manager.get("image")
+        fold = self._memmap_manager.get("fold")
+        trace_count = self._memmap_manager.get("trace_count")
+        offset_sum = self._memmap_manager.get("offset_sum")
+        azimuth_sin_sum = self._memmap_manager.get("azimuth_sin_sum")
+        azimuth_cos_sum = self._memmap_manager.get("azimuth_cos_sum")
+        self._debug.debug(f"Output image shape: {image.shape}, dtype: {image.dtype}")
+        self._debug.debug(f"Output fold shape: {fold.shape}, dtype: {fold.dtype}")
+
+        # Get completed tiles for skipping
+        completed = set(self._checkpoint.state.completed_tiles)
+        self._debug.info(f"Tiles already completed (resuming): {len(completed)}")
+
+        # Build kernel config
+        kernel_config = KernelConfig(
+            max_aperture_m=self.config.algorithm.aperture.max_aperture_m,
+            min_aperture_m=self.config.algorithm.aperture.min_aperture_m,
+            max_dip_degrees=self.config.algorithm.aperture.max_dip_degrees,
+            taper_fraction=self.config.algorithm.aperture.taper_fraction,
+            apply_spreading=self.config.algorithm.amplitude.geometrical_spreading,
+            apply_obliquity=self.config.algorithm.amplitude.obliquity_factor,
+            interpolation_method=self.config.algorithm.interpolation.value,
+            output_dt_ms=self.config.output.grid.dt_ms,
+        )
+
+        grid = self.config.output.grid
+        checkpoint_interval = self.config.execution.checkpoint.interval_tiles
+
+        self._debug.info(f"Starting tile loop: {self._tile_plan.n_tiles} total tiles")
+        self._debug.info(f"Using kernel: {type(self._kernel).__name__}")
+
+        # Aperture efficiency tracking
+        total_input_traces = self._trace_reader.n_traces
+        traces_per_tile_list: list[int] = []
+        total_trace_data_loaded_mb = 0.0
+        unique_trace_indices: set[int] = set()  # Track which traces have been loaded
+        dataset_size_mb = (self._trace_reader.n_traces * self._trace_reader.n_samples * 4) / 1024**2  # Assuming float32
+
+        self._debug.info(f"[APERTURE] Total input traces in dataset: {total_input_traces:,}")
+        self._debug.info(f"[APERTURE] Dataset size (approx): {dataset_size_mb:.1f} MB")
+
+        # Process tiles
+        for tile in iter_tiles(self._tile_plan, completed):
+            # Check control flags
+            if self._stop_requested:
+                logger.info("Stop requested, saving checkpoint...")
+                break
+
+            if self._pause_requested:
+                logger.info("Pause requested, saving checkpoint...")
+                self._save_checkpoint()
+                self._pause_requested = False
+                # In a real implementation, we'd wait here
+                # For now, just continue
+
+            # Process single tile (reports progress with trace count)
+            metrics, tile_trace_count, tile_data_mb, tile_trace_indices = self._process_tile(
+                tile, image, fold, trace_count, offset_sum, azimuth_sin_sum, azimuth_cos_sum, kernel_config, grid
+            )
+
+            # Track aperture efficiency
+            traces_per_tile_list.append(tile_trace_count)
+            total_trace_data_loaded_mb += tile_data_mb
+            unique_trace_indices.update(tile_trace_indices)
+
+            # Update metrics
+            self.metrics.n_tiles_completed += 1
+            self.metrics.n_traces_processed += metrics.n_traces_processed
+            # Track output bins completed (tile.nx * tile.ny pillars fully migrated)
+            self.metrics.n_output_bins_completed += tile.nx * tile.ny
+
+            # Report completion of this tile
+            self._report_progress(
+                current=self.metrics.n_tiles_completed,  # Now 1-indexed after increment
+                total=self._tile_plan.n_tiles,
+                message=f"Completed tile {tile.tile_id + 1}/{self._tile_plan.n_tiles} - {self.metrics.n_output_bins_completed:,}/{self.metrics.total_output_bins:,} output bins",
+                traces_in_tile=0,  # Tile is done
+                tile_x=0,
+                tile_y=0,
+            )
+            self.metrics.compute_time_total += metrics.compute_time_s
+
+            # Mark completed
+            self._checkpoint.mark_completed(
+                tile.tile_id,
+                n_traces=metrics.n_traces_processed,
+                compute_time=metrics.compute_time_s,
+            )
+
+            # Periodic checkpoint
+            if should_checkpoint(tile.tile_id, checkpoint_interval):
+                self._save_checkpoint()
+
+            # Log progress
+            if (tile.tile_id + 1) % 10 == 0:
+                eta = self.metrics.estimate_remaining_time()
+                logger.info(
+                    f"Progress: {self.metrics.n_tiles_completed}/{self._tile_plan.n_tiles} tiles, "
+                    f"ETA: {format_duration(eta)}"
+                )
+
+        # Final checkpoint
+        self._save_checkpoint()
+
+        # Print aperture efficiency summary
+        self._debug.info("=" * 60)
+        self._debug.info("APERTURE EFFICIENCY ANALYSIS")
+        self._debug.info("=" * 60)
+
+        if traces_per_tile_list:
+            import statistics
+            min_traces = min(traces_per_tile_list)
+            max_traces = max(traces_per_tile_list)
+            avg_traces = statistics.mean(traces_per_tile_list)
+            median_traces = statistics.median(traces_per_tile_list)
+            std_traces = statistics.stdev(traces_per_tile_list) if len(traces_per_tile_list) > 1 else 0
+
+            self._debug.info(f"[APERTURE] Traces per tile:")
+            self._debug.info(f"  Min: {min_traces:,}")
+            self._debug.info(f"  Max: {max_traces:,}")
+            self._debug.info(f"  Avg: {avg_traces:,.0f}")
+            self._debug.info(f"  Median: {median_traces:,.0f}")
+            self._debug.info(f"  Std Dev: {std_traces:,.0f}")
+
+            # Aperture efficiency indicator
+            efficiency = 100 * (1 - avg_traces / total_input_traces) if total_input_traces > 0 else 0
+            self._debug.info(f"[APERTURE] Aperture efficiency: {efficiency:.1f}%")
+            if avg_traces > 0.8 * total_input_traces:
+                self._debug.warning(f"[APERTURE] WARNING: Aperture is too wide! Most tiles use most traces.")
+                self._debug.warning(f"[APERTURE] Consider reducing max_aperture_m (currently: {self.config.algorithm.aperture.max_aperture_m}m)")
+
+            # Print to stderr for visibility
+            print(f"\n{'='*60}", file=sys.stderr, flush=True)
+            print(f"APERTURE EFFICIENCY ANALYSIS", file=sys.stderr, flush=True)
+            print(f"  Traces per tile: min={min_traces:,}, max={max_traces:,}, avg={avg_traces:,.0f}", file=sys.stderr, flush=True)
+            print(f"  Efficiency: {efficiency:.1f}% (higher=better spatial locality)", file=sys.stderr, flush=True)
+            if avg_traces > 0.8 * total_input_traces:
+                print(f"  ⚠️  WARNING: Aperture too wide! Consider reducing max_aperture_m", file=sys.stderr, flush=True)
+
+        # Memory profiling summary
+        self._debug.info(f"[MEMORY] Data loading analysis:")
+        self._debug.info(f"  Dataset size (approx): {dataset_size_mb:.1f} MB")
+        self._debug.info(f"  Total data loaded: {total_trace_data_loaded_mb:.1f} MB")
+        data_reuse_factor = total_trace_data_loaded_mb / dataset_size_mb if dataset_size_mb > 0 else 0
+        self._debug.info(f"  Data reuse factor: {data_reuse_factor:.1f}x (1.0=optimal, >1=traces loaded multiple times)")
+
+        unique_count = len(unique_trace_indices)
+        self._debug.info(f"  Unique traces loaded: {unique_count:,} / {total_input_traces:,}")
+        coverage = 100 * unique_count / total_input_traces if total_input_traces > 0 else 0
+        self._debug.info(f"  Trace coverage: {coverage:.1f}%")
+
+        print(f"MEMORY PROFILING:", file=sys.stderr, flush=True)
+        print(f"  Dataset: {dataset_size_mb:.1f} MB | Loaded: {total_trace_data_loaded_mb:.1f} MB", file=sys.stderr, flush=True)
+        print(f"  Data reuse factor: {data_reuse_factor:.1f}x", file=sys.stderr, flush=True)
+        print(f"  Unique traces: {unique_count:,}/{total_input_traces:,} ({coverage:.1f}%)", file=sys.stderr, flush=True)
+        print(f"{'='*60}\n", file=sys.stderr, flush=True)
+
+    def _process_tile(
+        self,
+        tile: TileSpec,
+        image: NDArray,
+        fold: NDArray,
+        trace_count: NDArray,
+        offset_sum: NDArray,
+        azimuth_sin_sum: NDArray,
+        azimuth_cos_sum: NDArray,
+        kernel_config: KernelConfig,
+        grid,
+    ) -> tuple[KernelMetrics, int, float, list[int]]:
+        """
+        Process a single tile.
+
+        Returns:
+            Tuple of (metrics, tile_trace_count, tile_data_mb, tile_trace_indices):
+            - metrics: Kernel execution metrics
+            - tile_trace_count: Number of traces that contributed to this tile
+            - tile_data_mb: Megabytes of trace data loaded for this tile
+            - tile_trace_indices: List of trace indices loaded for aperture tracking
+        """
+        tile_start_time = time.time()
+        self._debug.debug(f"--- Processing tile {tile.tile_id} ---")
+        self._debug.debug(f"  Tile bounds: x=[{tile.x_min:.1f}, {tile.x_max:.1f}], y=[{tile.y_min:.1f}, {tile.y_max:.1f}]")
+        self._debug.debug(f"  Tile grid indices: x=[{tile.x_start}, {tile.x_end}], y=[{tile.y_start}, {tile.y_end}]")
+        self._debug.debug(f"  Tile size: {tile.nx}x{tile.ny}")
+
+        assert self._spatial_index is not None
+        assert self._trace_reader is not None
+        assert self._header_manager is not None
+        assert self._velocity_manager is not None
+        assert self._kernel is not None
+
+        # Query traces in aperture
+        t0 = time.time()
+        query_result = query_traces_for_tile(
+            self._spatial_index,
+            tile.x_min,
+            tile.x_max,
+            tile.y_min,
+            tile.y_max,
+            kernel_config.max_aperture_m,
+        )
+        t_query = time.time() - t0
+        self._debug.info(f"  [TIMING] Spatial query: {t_query:.3f}s - found {query_result.n_traces:,} traces")
+
+        # Report progress with trace count (before heavy processing)
+        # Use tile_id (0-indexed) as current to show we're WORKING on this tile, not done
+        assert self._tile_plan is not None
+        tile_ix = tile.x_start // max(1, tile.nx)
+        tile_iy = tile.y_start // max(1, tile.ny)
+        self._report_progress(
+            current=tile.tile_id,  # 0-indexed: show 0/1 while working on tile 0
+            total=self._tile_plan.n_tiles,
+            message=f"Processing tile {tile.tile_id + 1}/{self._tile_plan.n_tiles} ({tile_ix},{tile_iy}) - {query_result.n_traces:,} traces",
+            traces_in_tile=query_result.n_traces,
+            tile_x=tile_ix,
+            tile_y=tile_iy,
+        )
+
+        if query_result.n_traces == 0:
+            # No traces contribute to this tile
+            self._debug.debug(f"  No traces for tile {tile.tile_id}, skipping")
+            return (
+                KernelMetrics(n_traces_processed=0, n_samples_output=0, compute_time_s=0.0),
+                0,  # tile_trace_count
+                0.0,  # tile_data_mb
+                [],  # tile_trace_indices
+            )
+
+        # Load trace data
+        t0 = time.time()
+        trace_data = self._trace_reader.get_traces(query_result.trace_indices)
+        t_trace_load = time.time() - t0
+        trace_data_mb = trace_data.nbytes / 1024**2
+        self._debug.info(f"  [TIMING] Trace data load: {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB)")
+
+        # Load geometry
+        t0 = time.time()
+        geometry = self._header_manager.get_geometry_for_indices(query_result.trace_indices)
+        t_geom_load = time.time() - t0
+        self._debug.info(f"  [TIMING] Geometry load: {t_geom_load:.3f}s")
+
+        # Create trace block
+        traces = create_trace_block(
+            amplitudes=trace_data,
+            source_x=geometry.source_x,
+            source_y=geometry.source_y,
+            receiver_x=geometry.receiver_x,
+            receiver_y=geometry.receiver_y,
+            sample_rate_ms=self._trace_reader.sample_rate_ms or 2.0,
+            start_time_ms=self._trace_reader.info.start_time_ms or 0.0,
+        )
+        self._debug.debug(f"  TraceBlock: {traces.n_traces} traces, {traces.n_samples} samples")
+
+        # Create output tile
+        output_tile = OutputTile(
+            image=np.zeros((tile.nx, tile.ny, grid.nt), dtype=np.float64),
+            fold=np.zeros((tile.nx, tile.ny), dtype=np.int32),
+            x_axis=np.linspace(tile.x_min, tile.x_max, tile.nx),
+            y_axis=np.linspace(tile.y_min, tile.y_max, tile.ny),
+            t_axis_ms=np.arange(grid.t_min_ms, grid.t_max_ms + grid.dt_ms / 2, grid.dt_ms),
+        )
+        self._debug.debug(f"  Output tile shape: {output_tile.image.shape}")
+
+        # Get velocity for tile (supports both 1D and 3D)
+        t0 = time.time()
+        velocity = self._velocity_manager.get_velocity_slice_for_tile(
+            tile.x_start, tile.x_end,
+            tile.y_start, tile.y_end,
+        )
+        t_velocity = time.time() - t0
+        self._debug.info(f"  [TIMING] Velocity slice: {t_velocity:.3f}s - is_1d={velocity.is_1d}, shape={velocity.vrms.shape}")
+
+        # Execute kernel
+        self._debug.info(f"  Executing kernel: {type(self._kernel).__name__}.migrate_tile()")
+        self._debug.info(f"  === KERNEL START ===")
+        n_output_points = output_tile.nx * output_tile.ny * output_tile.nt
+        n_point_trace_pairs = output_tile.nx * output_tile.ny * traces.n_traces
+        self._debug.info(f"  Output grid: {output_tile.nx} x {output_tile.ny} x {output_tile.nt} = {n_output_points:,} points")
+        self._debug.info(f"  Traces: {traces.n_traces:,}")
+        self._debug.info(f"  Estimated ops: {n_point_trace_pairs:,.0f} point-trace pairs")
+
+        # Print directly to stderr so it shows immediately
+        print(f"\n{'='*60}", file=sys.stderr, flush=True)
+        print(f"KERNEL EXECUTING - This may take a LONG time!", file=sys.stderr, flush=True)
+        print(f"  Grid: {output_tile.nx}x{output_tile.ny}x{output_tile.nt}", file=sys.stderr, flush=True)
+        print(f"  Traces: {traces.n_traces:,}", file=sys.stderr, flush=True)
+        print(f"  Point-trace pairs: {n_point_trace_pairs:,.0f}", file=sys.stderr, flush=True)
+        print(f"{'='*60}\n", file=sys.stderr, flush=True)
+
+        log_memory_state(self._debug, f"tile_{tile.tile_id}_before_kernel")
+
+        # Initialize CPU monitoring (call once to start sampling)
+        if HAS_PSUTIL:
+            psutil.cpu_percent(interval=None, percpu=True)  # Prime the pump
+
+        kernel_start = time.time()
+        metrics = self._kernel.migrate_tile(traces, output_tile, velocity, kernel_config)
+        kernel_time = time.time() - kernel_start
+
+        # Get CPU utilization during kernel (shows what happened during execution)
+        cpu_info = get_cpu_info()
+        if cpu_info.get("available"):
+            n_cores = cpu_info["n_cores"]
+            active = cpu_info["active_cores"]
+            busy = cpu_info["busy_cores"]
+            overall = cpu_info["overall_percent"]
+            self._debug.info(f"  [CPU] Overall: {overall:.1f}% | Active cores (>50%): {active}/{n_cores} | Busy cores (>90%): {busy}/{n_cores}")
+            print(f"  [CPU] Overall: {overall:.1f}% | Active: {active}/{n_cores} cores | Busy: {busy}/{n_cores} cores", file=sys.stderr, flush=True)
+
+        self._debug.info(f"  === KERNEL COMPLETE ===")
+        self._debug.info(f"  Kernel completed in {kernel_time:.3f}s")
+
+        # Calculate performance metrics
+        traces_per_sec = traces.n_traces / kernel_time if kernel_time > 0 else 0
+        points_per_sec = n_output_points / kernel_time if kernel_time > 0 else 0
+        pairs_per_sec = n_point_trace_pairs / kernel_time if kernel_time > 0 else 0
+
+        print(f"\nKERNEL COMPLETE: {kernel_time:.1f}s", file=sys.stderr, flush=True)
+        print(f"  Performance: {traces_per_sec:,.0f} traces/s | {points_per_sec/1e6:.2f}M points/s | {pairs_per_sec/1e6:.1f}M pairs/s", file=sys.stderr, flush=True)
+
+        self._debug.info(f"  [PERF] {traces_per_sec:,.0f} traces/s | {points_per_sec/1e6:.2f}M points/s | {pairs_per_sec/1e6:.1f}M pairs/s")
+        self._debug.debug(f"  Kernel metrics: {metrics.n_traces_processed} traces, {metrics.n_samples_output} samples")
+        log_memory_state(self._debug, f"tile_{tile.tile_id}_after_kernel")
+
+        # Accumulate to output
+        t0 = time.time()
+        image[tile.x_start:tile.x_end, tile.y_start:tile.y_end, :] += output_tile.image
+        fold[tile.x_start:tile.x_end, tile.y_start:tile.y_end] += output_tile.fold
+
+        # Accumulate header values (offset, azimuth) per output bin
+        # This enables later resort to CIG (common offset, common angle, etc.)
+        if geometry.n_traces > 0:
+            # Compute azimuth from source/receiver (degrees, 0-360)
+            dx = geometry.receiver_x - geometry.source_x
+            dy = geometry.receiver_y - geometry.source_y
+            azimuth_rad = np.arctan2(dx, dy)  # North = 0
+            azimuth_deg = np.degrees(azimuth_rad) % 360
+
+            # Convert to radians for sin/cos accumulation (circular mean)
+            azimuth_rad_for_mean = np.radians(azimuth_deg)
+
+            # Compute bin indices for each trace midpoint
+            # Map midpoint to tile-local bin indices
+            ix_local = np.floor((geometry.midpoint_x - tile.x_min) / grid.dx).astype(np.int32)
+            iy_local = np.floor((geometry.midpoint_y - tile.y_min) / grid.dy).astype(np.int32)
+
+            # Clamp to valid range and convert to global indices
+            ix_local = np.clip(ix_local, 0, tile.nx - 1)
+            iy_local = np.clip(iy_local, 0, tile.ny - 1)
+            ix_global = ix_local + tile.x_start
+            iy_global = iy_local + tile.y_start
+
+            # Accumulate using np.add.at for thread-safe binning
+            np.add.at(trace_count, (ix_global, iy_global), 1)
+            np.add.at(offset_sum, (ix_global, iy_global), geometry.offset)
+            np.add.at(azimuth_sin_sum, (ix_global, iy_global), np.sin(azimuth_rad_for_mean))
+            np.add.at(azimuth_cos_sum, (ix_global, iy_global), np.cos(azimuth_rad_for_mean))
+
+        t_accumulate = time.time() - t0
+        self._debug.info(f"  [TIMING] Accumulate to output: {t_accumulate:.3f}s")
+
+        tile_time = time.time() - tile_start_time
+
+        # Print timing summary for this tile
+        t_other = tile_time - (t_query + t_trace_load + t_geom_load + t_velocity + kernel_time + t_accumulate)
+        self._debug.info(f"  [TIMING SUMMARY] Tile {tile.tile_id}:")
+        self._debug.info(f"    Spatial query:   {t_query:6.3f}s ({100*t_query/tile_time:5.1f}%)")
+        self._debug.info(f"    Trace load:      {t_trace_load:6.3f}s ({100*t_trace_load/tile_time:5.1f}%)")
+        self._debug.info(f"    Geometry load:   {t_geom_load:6.3f}s ({100*t_geom_load/tile_time:5.1f}%)")
+        self._debug.info(f"    Velocity slice:  {t_velocity:6.3f}s ({100*t_velocity/tile_time:5.1f}%)")
+        self._debug.info(f"    KERNEL:          {kernel_time:6.3f}s ({100*kernel_time/tile_time:5.1f}%) <-- Main work")
+        self._debug.info(f"    Accumulate:      {t_accumulate:6.3f}s ({100*t_accumulate/tile_time:5.1f}%)")
+        self._debug.info(f"    Other overhead:  {t_other:6.3f}s ({100*t_other/tile_time:5.1f}%)")
+        self._debug.info(f"    TOTAL:           {tile_time:6.3f}s")
+
+        print(f"\n  TILE {tile.tile_id} TIMING BREAKDOWN:", file=sys.stderr, flush=True)
+        print(f"    Query: {t_query:.2f}s | Load: {t_trace_load:.2f}s | Geom: {t_geom_load:.2f}s | Vel: {t_velocity:.2f}s", file=sys.stderr, flush=True)
+        print(f"    KERNEL: {kernel_time:.2f}s ({100*kernel_time/tile_time:.0f}%) | Accum: {t_accumulate:.2f}s | Total: {tile_time:.2f}s\n", file=sys.stderr, flush=True)
+
+        # Return metrics and aperture tracking data
+        return (
+            metrics,
+            query_result.n_traces,  # tile_trace_count
+            trace_data_mb,  # tile_data_mb
+            list(query_result.trace_indices),  # tile_trace_indices
+        )
+
+    def _finalize(self) -> None:
+        """Finalize migration output."""
+        assert self._memmap_manager is not None
+
+        logger.info("Normalizing output...")
+
+        image = self._memmap_manager.get("image")
+        fold = self._memmap_manager.get("fold")
+
+        # Normalize by fold (skip if fold is all zeros - e.g., Metal C++ 3D kernels don't track fold)
+        fold_3d = fold[:, :, np.newaxis]
+        if np.any(fold > 0):
+            with np.errstate(invalid="ignore", divide="ignore"):
+                image_normalized = np.where(fold_3d > 0, image / fold_3d, 0.0)
+        else:
+            # No fold data - use raw image (already accumulated)
+            logger.warning("Fold is all zeros - skipping normalization (using raw stacked image)")
+            image_normalized = image
+
+        logger.info("Writing output files...")
+
+        # Write to Zarr
+        output_path = self.config.output.output_dir / "migrated_stack.zarr"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        grid = self.config.output.grid
+        z = zarr.open(
+            str(output_path),
+            mode="w",
+            shape=image_normalized.shape,
+            chunks=(
+                self.config.output.chunk_x,
+                self.config.output.chunk_y,
+                self.config.output.chunk_t or grid.nt,
+            ),
+            dtype=np.float32,
+        )
+        z[:] = image_normalized.astype(np.float32)
+
+        # Add metadata
+        z.attrs["x_min"] = grid.x_min
+        z.attrs["x_max"] = grid.x_max
+        z.attrs["dx"] = grid.dx
+        z.attrs["y_min"] = grid.y_min
+        z.attrs["y_max"] = grid.y_max
+        z.attrs["dy"] = grid.dy
+        z.attrs["t_min_ms"] = grid.t_min_ms
+        z.attrs["t_max_ms"] = grid.t_max_ms
+        z.attrs["dt_ms"] = grid.dt_ms
+        z.attrs["migration_type"] = "PSTM"
+
+        # Write fold map
+        if self.config.output.products.fold_volume:
+            fold_path = self.config.output.output_dir / "fold.zarr"
+            z_fold = zarr.open(str(fold_path), mode="w", shape=fold.shape, dtype=np.int32)
+            z_fold[:] = fold
+            z_fold.attrs["description"] = "Migration fold map"
+
+        # Compute and write average header values (offset, azimuth) per bin
+        # These enable resort to CIG (common offset, common angle, etc.)
+        logger.info("Computing average headers per bin...")
+        trace_count = self._memmap_manager.get("trace_count")
+        offset_sum = self._memmap_manager.get("offset_sum")
+        azimuth_sin_sum = self._memmap_manager.get("azimuth_sin_sum")
+        azimuth_cos_sum = self._memmap_manager.get("azimuth_cos_sum")
+
+        # Use trace_count for averaging (independent of kernel fold tracking)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # Average offset per bin
+            offset_avg = np.where(trace_count > 0, offset_sum / trace_count, 0.0)
+
+            # Circular mean for azimuth: atan2(sum_sin, sum_cos)
+            azimuth_avg = np.degrees(np.arctan2(azimuth_sin_sum, azimuth_cos_sum)) % 360
+            # Set to 0 where no data
+            azimuth_avg = np.where(trace_count > 0, azimuth_avg, 0.0)
+
+        # Write headers to Parquet (tabular format for CIG resort)
+        headers_path = self.config.output.output_dir / "bin_headers.parquet"
+
+        # Build grid coordinate arrays
+        x_coords = np.linspace(grid.x_min, grid.x_max, grid.nx)
+        y_coords = np.linspace(grid.y_min, grid.y_max, grid.ny)
+
+        # Create meshgrid for bin coordinates
+        xx, yy = np.meshgrid(np.arange(grid.nx), np.arange(grid.ny), indexing="ij")
+        x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing="ij")
+
+        # Flatten 2D arrays to 1D for Parquet table
+        df = pl.DataFrame({
+            "ix": xx.ravel().astype(np.int32),
+            "iy": yy.ravel().astype(np.int32),
+            "x": x_grid.ravel().astype(np.float64),
+            "y": y_grid.ravel().astype(np.float64),
+            "trace_count": trace_count.ravel().astype(np.int32),
+            "offset_avg": offset_avg.ravel().astype(np.float32),
+            "azimuth_avg": azimuth_avg.ravel().astype(np.float32),
+        })
+
+        # Filter to only bins with data (optional, keeps file smaller)
+        df_with_data = df.filter(pl.col("trace_count") > 0)
+
+        # Write to Parquet
+        df_with_data.write_parquet(str(headers_path))
+
+        logger.info(
+            f"Headers written to {headers_path}: "
+            f"{len(df_with_data)} bins with data out of {grid.nx * grid.ny} total"
+        )
+
+        # Clean up checkpoint
+        if self._checkpoint:
+            self._checkpoint.cleanup()
+
+        print_success(f"Output written to {output_path}")
+
+    def _save_checkpoint(self) -> None:
+        """Save checkpoint."""
+        if self._checkpoint and self.config.execution.checkpoint.enabled:
+            self._checkpoint.save()
+            if self._memmap_manager:
+                self._memmap_manager.flush()
+
+    def _cleanup(self) -> None:
+        """Clean up resources."""
+        logger.debug("Cleaning up resources...")
+
+        if self._trace_reader:
+            self._trace_reader.close()
+
+        if self._header_manager:
+            self._header_manager.close()
+
+        if self._kernel:
+            self._kernel.cleanup()
+
+        if self._memmap_manager:
+            self._memmap_manager.release_all(delete_files=True)
+
+    def _print_summary(self) -> None:
+        """Print execution summary."""
+        print_section("Migration Complete")
+        print_metric("Total time", format_duration(self.metrics.elapsed_time))
+        print_metric("Tiles processed", f"{self.metrics.n_tiles_completed:,}")
+        print_metric("Traces processed", f"{self.metrics.n_traces_processed:,}")
+        print_metric("Compute time", format_duration(self.metrics.compute_time_total))
+        print_metric("Processing rate", f"{self.metrics.traces_per_second:.0f} traces/s")
+
+        if self.metrics.warnings:
+            logger.warning(f"{len(self.metrics.warnings)} warnings during execution")
+
+
+def run_migration(
+    config: MigrationConfig,
+    resume: bool = False,
+    progress_callback: ProgressCallback | None = None,
+) -> bool:
+    """
+    Convenience function to run migration.
+
+    Args:
+        config: Migration configuration
+        resume: Attempt to resume from checkpoint
+        progress_callback: Optional progress callback
+
+    Returns:
+        True if completed successfully
+    """
+    executor = MigrationExecutor(config, progress_callback)
+    return executor.run(resume=resume)
