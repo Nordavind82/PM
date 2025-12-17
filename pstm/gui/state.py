@@ -69,17 +69,19 @@ class OutputGridState:
     
     @property
     def nx(self) -> int:
-        """Number of inline bins."""
+        """Number of inline bins (including both endpoints)."""
         pts = self.corners.as_array()
         inline_length = np.linalg.norm(pts[1] - pts[0])
-        return max(1, int(np.ceil(inline_length / self.dx)))
-    
+        # +1 to include both endpoints, matching OutputGridConfig formula
+        return max(1, int(inline_length / self.dx) + 1)
+
     @property
     def ny(self) -> int:
-        """Number of crossline bins."""
+        """Number of crossline bins (including both endpoints)."""
         pts = self.corners.as_array()
         xline_length = np.linalg.norm(pts[3] - pts[0])
-        return max(1, int(np.ceil(xline_length / self.dy)))
+        # +1 to include both endpoints, matching OutputGridConfig formula
+        return max(1, int(xline_length / self.dy) + 1)
     
     @property
     def nt(self) -> int:
@@ -198,22 +200,86 @@ class ExecutionState:
 @dataclass
 class InputDataState:
     """Input data state."""
+    # Unified dataset path (directory containing traces.zarr and headers.parquet)
+    dataset_path: str = ""
+
+    # Legacy paths (auto-derived from dataset_path, kept for backward compatibility)
     traces_path: str = ""
     traces_format: str = "zarr"
     headers_path: str = ""
     headers_format: str = "parquet"
-    col_source_x: str = "SOU_X"
-    col_source_y: str = "SOU_Y"
-    col_receiver_x: str = "REC_X"
-    col_receiver_y: str = "REC_Y"
-    col_midpoint_x: str = "CDP_X"
-    col_midpoint_y: str = "CDP_Y"
-    col_offset: str = "OFFSET"
-    col_azimuth: str = "AZIMUTH"
+
+    # Column mappings (user-configurable, auto-detected on load)
+    col_source_x: str = ""
+    col_source_y: str = ""
+    col_receiver_x: str = ""
+    col_receiver_y: str = ""
+    col_midpoint_x: str = ""
+    col_midpoint_y: str = ""
+    col_offset: str = ""
+    col_azimuth: str = ""
+    col_trace_index: str = ""
+    col_scalar_coord: str = ""  # SEG-Y coordinate scalar column
+
+    # Coordinate scalar settings
+    apply_coord_scalar: bool = True  # Apply SEG-Y scalar to coordinates
+    coord_scalar_value: int = 1  # Detected or manual scalar value (negative = divide)
+
+    # Loaded data info
     n_traces: int = 0
     n_samples: int = 0
     sample_rate_ms: float = 0.0
     is_loaded: bool = False
+    # True if traces stored as (n_samples, n_traces) instead of (n_traces, n_samples)
+    traces_transposed: bool = False
+
+    def resolve_paths(self) -> tuple[str, str]:
+        """Resolve traces and headers paths from dataset_path.
+
+        Returns:
+            Tuple of (traces_path, headers_path)
+        """
+        if self.dataset_path:
+            from pathlib import Path
+            base = Path(self.dataset_path)
+
+            # Try standard names first
+            traces_candidates = [
+                base / "traces.zarr",
+                base / "diffractor_traces.zarr",
+            ]
+            headers_candidates = [
+                base / "headers.parquet",
+                base / "diffractor_headers.parquet",
+            ]
+
+            # Find first existing traces
+            traces_path = ""
+            for p in traces_candidates:
+                if p.exists():
+                    traces_path = str(p)
+                    break
+            # Fallback: any .zarr in directory
+            if not traces_path:
+                zarrs = list(base.glob("*.zarr"))
+                if zarrs:
+                    traces_path = str(zarrs[0])
+
+            # Find first existing headers
+            headers_path = ""
+            for p in headers_candidates:
+                if p.exists():
+                    headers_path = str(p)
+                    break
+            # Fallback: any .parquet in directory
+            if not headers_path:
+                parquets = list(base.glob("*.parquet"))
+                if parquets:
+                    headers_path = str(parquets[0])
+
+            return traces_path, headers_path
+
+        return self.traces_path, self.headers_path
 
 
 @dataclass
@@ -226,7 +292,11 @@ class SurveyState:
     offset_min: float = 0.0
     offset_max: float = 0.0
     offset_mean: float = 0.0
+    azimuth_min: float = 0.0
+    azimuth_max: float = 360.0
     n_shots: int = 0
+    n_sources: int = 0
+    n_receivers: int = 0
     fold_computed: bool = False
     max_fold: int = 0
     mean_fold: float = 0.0
@@ -390,35 +460,110 @@ class WizardController:
         try:
             import zarr
             import pandas as pd
-            
+            import json
+            from pathlib import Path
+
             state = self.state.input_data
-            
+
+            # Resolve paths from dataset_path if set
+            traces_path, headers_path = state.resolve_paths()
+
+            # Update state with resolved paths
+            if traces_path:
+                state.traces_path = traces_path
+            if headers_path:
+                state.headers_path = headers_path
+
+            if not state.headers_path:
+                return False, "No headers file found"
+            if not state.traces_path:
+                return False, "No traces file found"
+
             if state.headers_format == "parquet":
                 self._headers_df = pd.read_parquet(state.headers_path)
             elif state.headers_format == "csv":
                 self._headers_df = pd.read_csv(state.headers_path)
             else:
                 return False, f"Unsupported header format: {state.headers_format}"
-            
+
+            n_headers = len(self._headers_df)
+
+            # Check for metadata.json (SeisProc format)
+            metadata_path = None
+            if state.dataset_path:
+                metadata_path = Path(state.dataset_path) / "metadata.json"
+            elif state.traces_path:
+                metadata_path = Path(state.traces_path).parent / "metadata.json"
+
+            metadata = None
+            if metadata_path and metadata_path.exists():
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+
             if state.traces_format == "zarr":
                 traces = zarr.open(state.traces_path, mode='r')
                 if isinstance(traces, zarr.Array):
-                    state.n_traces, state.n_samples = traces.shape
+                    zarr_shape = traces.shape
                 else:
                     if 'data' in traces:
-                        state.n_traces, state.n_samples = traces['data'].shape
+                        zarr_shape = traces['data'].shape
                     else:
                         return False, "Could not find trace data in Zarr group"
-            
-            if len(self._headers_df) != state.n_traces:
-                return False, f"Header count ({len(self._headers_df)}) doesn't match trace count ({state.n_traces})"
-            
+
+                # Determine n_traces and n_samples, handling transposed data
+                # SeisProc stores as (n_samples, n_traces), PSTM expects (n_traces, n_samples)
+                if metadata and 'n_traces' in metadata and 'n_samples' in metadata:
+                    # Use metadata values (authoritative)
+                    state.n_traces = metadata['n_traces']
+                    state.n_samples = metadata['n_samples']
+                    state.sample_rate_ms = metadata.get('sample_rate', 0.0)
+                    # Check if zarr shape is transposed
+                    if zarr_shape[0] == state.n_samples and zarr_shape[1] == state.n_traces:
+                        state.traces_transposed = True
+                    else:
+                        state.traces_transposed = False
+                else:
+                    # No metadata - infer from shape and header count
+                    dim0, dim1 = zarr_shape
+                    if dim0 == n_headers:
+                        # Standard format: (n_traces, n_samples)
+                        state.n_traces, state.n_samples = dim0, dim1
+                        state.traces_transposed = False
+                    elif dim1 == n_headers:
+                        # Transposed format: (n_samples, n_traces)
+                        state.n_samples, state.n_traces = dim0, dim1
+                        state.traces_transposed = True
+                    else:
+                        return False, f"Zarr shape {zarr_shape} doesn't match header count ({n_headers})"
+
+            if n_headers != state.n_traces:
+                return False, f"Header count ({n_headers}) doesn't match trace count ({state.n_traces})"
+
+            # Auto-detect coordinate scalar column and value
+            scalar_col_candidates = ["scalar_coord", "SCALCO", "coord_scalar", "scalar"]
+            for col in scalar_col_candidates:
+                if col in self._headers_df.columns:
+                    state.col_scalar_coord = col
+                    # Get the most common scalar value (should be same for all traces)
+                    scalar_values = self._headers_df[col].unique()
+                    if len(scalar_values) == 1:
+                        state.coord_scalar_value = int(scalar_values[0])
+                    else:
+                        # Use the first non-zero value
+                        for sv in scalar_values:
+                            if sv != 0:
+                                state.coord_scalar_value = int(sv)
+                                break
+                    break
+
             state.is_loaded = True
             self.state.step_status["input"] = StepStatus.COMPLETE
             self.notify_change()
-            
-            return True, f"Loaded {state.n_traces} traces × {state.n_samples} samples"
-            
+
+            fmt_note = " [transposed]" if state.traces_transposed else ""
+            scalar_note = f", scalar={state.coord_scalar_value}" if state.coord_scalar_value != 1 else ""
+            return True, f"Loaded {state.n_traces:,} traces × {state.n_samples} samples{fmt_note}{scalar_note}"
+
         except Exception as e:
             self.state.step_status["input"] = StepStatus.ERROR
             return False, str(e)
@@ -451,45 +596,89 @@ class WizardController:
         
         return mapping
     
+    def _apply_coord_scalar(self, values: np.ndarray) -> np.ndarray:
+        """Apply SEG-Y coordinate scalar to values.
+
+        SEG-Y convention:
+        - If scalar > 0: multiply by scalar
+        - If scalar < 0: divide by abs(scalar)
+        - If scalar == 0 or 1: no change
+        """
+        inp = self.state.input_data
+        if not inp.apply_coord_scalar:
+            return values
+
+        scalar = inp.coord_scalar_value
+        if scalar == 0 or scalar == 1:
+            return values
+        elif scalar > 0:
+            return values * scalar
+        else:
+            return values / abs(scalar)
+
     def analyze_survey_geometry(self) -> tuple[bool, str]:
         """Analyze survey geometry from loaded headers."""
         if self._headers_df is None:
             return False, "No header data loaded"
-        
+
         try:
             df = self._headers_df
             state = self.state.survey
             inp = self.state.input_data
-            
-            sx = df[inp.col_source_x].values
-            sy = df[inp.col_source_y].values
-            rx = df[inp.col_receiver_x].values
-            ry = df[inp.col_receiver_y].values
-            
+
+            # Get raw coordinates and apply scalar
+            sx = self._apply_coord_scalar(df[inp.col_source_x].values.astype(np.float64))
+            sy = self._apply_coord_scalar(df[inp.col_source_y].values.astype(np.float64))
+            rx = self._apply_coord_scalar(df[inp.col_receiver_x].values.astype(np.float64))
+            ry = self._apply_coord_scalar(df[inp.col_receiver_y].values.astype(np.float64))
+
             state.x_min = min(sx.min(), rx.min())
             state.x_max = max(sx.max(), rx.max())
             state.y_min = min(sy.min(), ry.min())
             state.y_max = max(sy.max(), ry.max())
-            
+
             if inp.col_offset in df.columns:
-                offsets = df[inp.col_offset].values
+                # Offset is already in correct units, but apply scalar if needed
+                offsets = self._apply_coord_scalar(df[inp.col_offset].values.astype(np.float64))
             else:
+                # Compute offset from scaled coordinates
                 offsets = np.sqrt((rx - sx)**2 + (ry - sy)**2)
-            
+
             state.offset_min = float(offsets.min())
             state.offset_max = float(offsets.max())
             state.offset_mean = float(offsets.mean())
-            
+
+            # Compute azimuth range
+            if inp.col_azimuth and inp.col_azimuth in df.columns:
+                azimuths = df[inp.col_azimuth].values
+                state.azimuth_min = float(azimuths.min())
+                state.azimuth_max = float(azimuths.max())
+            else:
+                # Compute azimuth from source-receiver geometry
+                dx = rx - sx
+                dy = ry - sy
+                azimuths = np.degrees(np.arctan2(dx, dy)) % 360
+                state.azimuth_min = float(azimuths.min())
+                state.azimuth_max = float(azimuths.max())
+
+            # Count unique sources and receivers
+            sources = df[[inp.col_source_x, inp.col_source_y]].drop_duplicates()
+            receivers = df[[inp.col_receiver_x, inp.col_receiver_y]].drop_duplicates()
+            state.n_sources = len(sources)
+            state.n_receivers = len(receivers)
+
             if "SHOT_ID" in df.columns:
                 state.n_shots = df["SHOT_ID"].nunique()
             elif "FFID" in df.columns:
                 state.n_shots = df["FFID"].nunique()
-            
+            else:
+                state.n_shots = state.n_sources  # Use unique sources as shots
+
             self.state.step_status["survey"] = StepStatus.COMPLETE
             self.notify_change()
-            
+
             return True, "Survey geometry analyzed"
-            
+
         except Exception as e:
             self.state.step_status["survey"] = StepStatus.ERROR
             return False, str(e)
@@ -517,21 +706,21 @@ class WizardController:
             df = self._headers_df
             inp = self.state.input_data
 
-            # Get source/receiver coordinates
-            sx = df[inp.col_source_x].values
-            sy = df[inp.col_source_y].values
-            rx = df[inp.col_receiver_x].values
-            ry = df[inp.col_receiver_y].values
+            # Get source/receiver coordinates and apply scalar
+            sx = self._apply_coord_scalar(df[inp.col_source_x].values.astype(np.float64))
+            sy = self._apply_coord_scalar(df[inp.col_source_y].values.astype(np.float64))
+            rx = self._apply_coord_scalar(df[inp.col_receiver_x].values.astype(np.float64))
+            ry = self._apply_coord_scalar(df[inp.col_receiver_y].values.astype(np.float64))
 
             # Compute midpoints
             mx_col = inp.col_midpoint_x
             my_col = inp.col_midpoint_y
 
             if mx_col in df.columns and my_col in df.columns:
-                mx = df[mx_col].values
-                my = df[my_col].values
+                mx = self._apply_coord_scalar(df[mx_col].values.astype(np.float64))
+                my = self._apply_coord_scalar(df[my_col].values.astype(np.float64))
             else:
-                # Compute from source/receiver
+                # Compute from scaled source/receiver
                 mx = (sx + rx) / 2
                 my = (sy + ry) / 2
 
@@ -547,7 +736,197 @@ class WizardController:
 
         except Exception:
             return None
-    
+
+    def compute_acquisition_azimuth(self) -> float | None:
+        """Compute acquisition azimuth (inline direction) from survey geometry.
+
+        Tries multiple methods in order of preference:
+        1. Inline/crossline grid direction (most accurate for 3D surveys)
+        2. Source line direction
+        3. PCA on midpoint distribution (fallback)
+
+        Returns:
+            Azimuth in degrees (0-180), or None if cannot compute.
+        """
+        if self._headers_df is None:
+            return None
+
+        try:
+            df = self._headers_df
+            inp = self.state.input_data
+
+            # Get scaled coordinates
+            sx = self._apply_coord_scalar(df[inp.col_source_x].values.astype(np.float64))
+            sy = self._apply_coord_scalar(df[inp.col_source_y].values.astype(np.float64))
+            rx = self._apply_coord_scalar(df[inp.col_receiver_x].values.astype(np.float64))
+            ry = self._apply_coord_scalar(df[inp.col_receiver_y].values.astype(np.float64))
+            mx = (sx + rx) / 2
+            my = (sy + ry) / 2
+
+            # Method 1: Use inline/crossline grid if available
+            if "inline" in df.columns and "crossline" in df.columns:
+                # Find crossline direction by looking at points along a single inline
+                mid_inline = (df["inline"].min() + df["inline"].max()) // 2
+                il_mask = df["inline"] == mid_inline
+                if il_mask.sum() > 10:
+                    il_mx = mx[il_mask]
+                    il_my = my[il_mask]
+                    # Sort by crossline to get direction
+                    idx_sorted = np.argsort(df.loc[il_mask, "crossline"].values)
+                    dx = il_mx[idx_sorted[-1]] - il_mx[idx_sorted[0]]
+                    dy = il_my[idx_sorted[-1]] - il_my[idx_sorted[0]]
+                    crossline_az = np.degrees(np.arctan2(dx, dy))
+                    # Inline direction is perpendicular to crossline
+                    inline_az = (crossline_az + 90) % 180
+                    return float(inline_az)
+
+            # Method 2: Use shot line direction if s_line column exists
+            if "s_line" in df.columns:
+                # Get direction along shot lines
+                lines = df.groupby("s_line").agg({
+                    inp.col_source_x: ["first", "last", "count"],
+                    inp.col_source_y: ["first", "last"]
+                })
+                # Filter lines with enough points
+                valid_lines = lines[lines[(inp.col_source_x, "count")] > 5]
+                if len(valid_lines) > 3:
+                    dx = self._apply_coord_scalar(
+                        valid_lines[(inp.col_source_x, "last")].values -
+                        valid_lines[(inp.col_source_x, "first")].values
+                    )
+                    dy = self._apply_coord_scalar(
+                        valid_lines[(inp.col_source_y, "last")].values -
+                        valid_lines[(inp.col_source_y, "first")].values
+                    )
+                    # Average direction
+                    mean_dx = np.mean(dx)
+                    mean_dy = np.mean(dy)
+                    line_azimuth = np.degrees(np.arctan2(mean_dx, mean_dy))
+                    if line_azimuth < 0:
+                        line_azimuth += 180
+                    return float(line_azimuth)
+
+            # Method 3: PCA on midpoint distribution (fallback)
+            # Note: For 3D surveys, PCA often finds the crossline direction
+            # (maximum variance), so we may need to add 90 degrees
+
+            # Sample if too many points
+            if len(mx) > 50000:
+                indices = np.random.choice(len(mx), 50000, replace=False)
+                mx_sample = mx[indices]
+                my_sample = my[indices]
+            else:
+                mx_sample, my_sample = mx, my
+
+            # Center the data
+            mx_centered = mx_sample - mx_sample.mean()
+            my_centered = my_sample - my_sample.mean()
+
+            # Compute covariance matrix
+            cov = np.array([
+                [np.sum(mx_centered**2), np.sum(mx_centered * my_centered)],
+                [np.sum(mx_centered * my_centered), np.sum(my_centered**2)]
+            ]) / len(mx_sample)
+
+            # Eigenvalue decomposition
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+            # For 3D surveys, the principal axis (max variance) is usually crossline
+            # We want the inline direction, which is the minor axis (perpendicular)
+            # Use the eigenvector with SMALLER eigenvalue for inline direction
+            minor_axis = eigenvectors[:, np.argmin(eigenvalues)]
+            azimuth = np.degrees(np.arctan2(minor_axis[0], minor_axis[1]))
+
+            # Normalize to 0-180 range
+            if azimuth < 0:
+                azimuth += 180
+            if azimuth >= 180:
+                azimuth -= 180
+
+            return float(azimuth)
+
+        except Exception:
+            return None
+
+    def compute_rotated_extent(
+        self, azimuth_degrees: float, use_midpoints: bool = True
+    ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]] | None:
+        """Compute rotated bounding box corners for given azimuth.
+
+        Args:
+            azimuth_degrees: Grid azimuth in degrees (from Y-axis, clockwise positive)
+            use_midpoints: If True, use midpoint extent; otherwise use source/receiver extent
+
+        Returns:
+            Four corner points (c1, c2, c3, c4) as ((x1,y1), (x2,y2), (x3,y3), (x4,y4)),
+            where c1=SW/origin, c2=SE, c3=NE, c4=NW in rotated coordinates.
+        """
+        if self._headers_df is None:
+            return None
+
+        try:
+            df = self._headers_df
+            inp = self.state.input_data
+
+            # Get scaled coordinates
+            sx = self._apply_coord_scalar(df[inp.col_source_x].values.astype(np.float64))
+            sy = self._apply_coord_scalar(df[inp.col_source_y].values.astype(np.float64))
+            rx = self._apply_coord_scalar(df[inp.col_receiver_x].values.astype(np.float64))
+            ry = self._apply_coord_scalar(df[inp.col_receiver_y].values.astype(np.float64))
+
+            if use_midpoints:
+                # Use midpoint extent
+                px = (sx + rx) / 2
+                py = (sy + ry) / 2
+            else:
+                # Use full source/receiver extent
+                px = np.concatenate([sx, rx])
+                py = np.concatenate([sy, ry])
+
+            # Convert azimuth to radians (from Y-axis, clockwise)
+            theta = np.radians(azimuth_degrees)
+
+            # Rotation matrix (rotate points to align grid with axes)
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+            # Rotate points to grid-aligned coordinates
+            # This rotates the coordinate system so that the grid azimuth becomes the Y-axis
+            px_rot = px * cos_t + py * sin_t
+            py_rot = -px * sin_t + py * cos_t
+
+            # Get extent in rotated coordinates
+            x_min_rot, x_max_rot = px_rot.min(), px_rot.max()
+            y_min_rot, y_max_rot = py_rot.min(), py_rot.max()
+
+            # Add small buffer (0.5% of extent)
+            x_buffer = (x_max_rot - x_min_rot) * 0.005
+            y_buffer = (y_max_rot - y_min_rot) * 0.005
+            x_min_rot -= x_buffer
+            x_max_rot += x_buffer
+            y_min_rot -= y_buffer
+            y_max_rot += y_buffer
+
+            # Define corners in rotated coordinates
+            corners_rot = [
+                (x_min_rot, y_min_rot),  # C1 - SW/origin
+                (x_max_rot, y_min_rot),  # C2 - SE
+                (x_max_rot, y_max_rot),  # C3 - NE
+                (x_min_rot, y_max_rot),  # C4 - NW
+            ]
+
+            # Rotate corners back to world coordinates
+            corners_world = []
+            for xr, yr in corners_rot:
+                # Inverse rotation
+                x_world = xr * cos_t - yr * sin_t
+                y_world = xr * sin_t + yr * cos_t
+                corners_world.append((x_world, y_world))
+
+            return tuple(corners_world)
+
+        except Exception:
+            return None
+
     def compute_selection_mask(self) -> NDArray[np.bool_] | None:
         """Compute trace selection mask based on current criteria."""
         if self._headers_df is None:
@@ -698,6 +1077,7 @@ class WizardController:
             CheckpointConfig, OutputProductsConfig, OutputFormat,
             ApertureConfig, AmplitudeConfig, InterpolationMethod,
             ExecutionConfig, ResourceConfig, ComputeBackend,
+            ColumnMapping,
         )
 
         state = self.state
@@ -779,10 +1159,25 @@ class WizardController:
             raise ValueError("Output directory is required")
 
         # Build output products config
+        # Check if offset ranges are defined in data selection - these become output gather bins
+        gather_offset_ranges = None
+        output_gathers = False
+        if state.data_selection.mode == "offset" and state.data_selection.offset_ranges:
+            ranges = [
+                (r.min_offset or 0.0, r.max_offset or 1e9)
+                for r in state.data_selection.offset_ranges
+                if r.min_offset is not None or r.max_offset is not None
+            ]
+            if ranges:
+                gather_offset_ranges = ranges
+                output_gathers = True
+
         products = OutputProductsConfig(
             stacked_image=state.output.output_stacked_image,
             fold_volume=state.output.output_fold_map,
             common_image_gathers=state.output.output_cig,
+            output_gathers=output_gathers,
+            gather_offset_ranges=gather_offset_ranges,
         )
 
         # Determine output format
@@ -814,11 +1209,89 @@ class WizardController:
             ),
         )
 
+        # Build column mapping from user selections
+        column_mapping = ColumnMapping(
+            source_x=state.input_data.col_source_x or "SOU_X",
+            source_y=state.input_data.col_source_y or "SOU_Y",
+            receiver_x=state.input_data.col_receiver_x or "REC_X",
+            receiver_y=state.input_data.col_receiver_y or "REC_Y",
+            cdp_x=state.input_data.col_midpoint_x or None,
+            cdp_y=state.input_data.col_midpoint_y or None,
+            offset=state.input_data.col_offset or None,
+            azimuth=state.input_data.col_azimuth or None,
+            trace_index=state.input_data.col_trace_index or "trace_idx",
+        )
+
+        # Add scalar column to column mapping if detected
+        if state.input_data.col_scalar_coord:
+            column_mapping.coord_scalar = state.input_data.col_scalar_coord
+
+        # Build data selection config from GUI state
+        from pstm.config.data_selection import (
+            DataSelectionConfig, SelectionMode, OffsetRangeSelector,
+            OffsetRange as ConfigOffsetRange, RangeMode,
+            OffsetVectorSelector, CustomExpressionSelector,
+        )
+
+        ds = state.data_selection
+        if ds.mode == "all":
+            data_selection_config = DataSelectionConfig.use_all()
+        elif ds.mode == "offset":
+            # Convert GUI OffsetRange to config OffsetRange
+            config_ranges = []
+            for r in ds.offset_ranges:
+                if r.min_offset is not None or r.max_offset is not None:
+                    config_ranges.append(ConfigOffsetRange(
+                        min_offset=r.min_offset,
+                        max_offset=r.max_offset,
+                    ))
+
+            data_selection_config = DataSelectionConfig(
+                mode=SelectionMode.OFFSET_RANGE,
+                offset_selector=OffsetRangeSelector(
+                    ranges=config_ranges if config_ranges else None,
+                    mode=RangeMode.INCLUDE if ds.offset_include_mode else RangeMode.EXCLUDE,
+                    include_negative=ds.include_negative_offsets,
+                    use_absolute=True,
+                ),
+            )
+            debug_logger.info(f"BUILD_CONFIG: data_selection mode=offset, ranges={config_ranges}")
+        elif ds.mode == "ovt":
+            data_selection_config = DataSelectionConfig(
+                mode=SelectionMode.OFFSET_VECTOR,
+                offset_vector_selector=OffsetVectorSelector(
+                    offset_x_min=ds.offset_x_min,
+                    offset_x_max=ds.offset_x_max,
+                    offset_y_min=ds.offset_y_min,
+                    offset_y_max=ds.offset_y_max,
+                    tile_size_x=ds.ovt_tile_size_x,
+                    tile_size_y=ds.ovt_tile_size_y,
+                ),
+            )
+            debug_logger.info(f"BUILD_CONFIG: data_selection mode=ovt")
+        elif ds.mode == "custom" and ds.custom_expression:
+            data_selection_config = DataSelectionConfig(
+                mode=SelectionMode.CUSTOM,
+                custom_selector=CustomExpressionSelector(
+                    expression=ds.custom_expression,
+                ),
+            )
+            debug_logger.info(f"BUILD_CONFIG: data_selection mode=custom, expr={ds.custom_expression}")
+        else:
+            data_selection_config = DataSelectionConfig.use_all()
+            debug_logger.info(f"BUILD_CONFIG: data_selection mode=all (default)")
+
         config = MigrationConfig(
             name=state.output.project_name,
             input=InputConfig(
                 traces_path=state.input_data.traces_path,
                 headers_path=state.input_data.headers_path,
+                columns=column_mapping,
+                apply_coord_scalar=state.input_data.apply_coord_scalar,
+                sample_rate_ms=state.input_data.sample_rate_ms if state.input_data.sample_rate_ms > 0 else None,
+                num_samples=state.input_data.n_samples if state.input_data.n_samples > 0 else None,
+                num_traces=state.input_data.n_traces if state.input_data.n_traces > 0 else None,
+                transposed=state.input_data.traces_transposed,
             ),
             output=OutputConfig(
                 output_dir=state.output.output_dir,
@@ -829,6 +1302,7 @@ class WizardController:
             velocity=velocity_config,
             algorithm=algorithm_config,
             execution=execution_config,
+            data_selection=data_selection_config,
         )
 
         return config

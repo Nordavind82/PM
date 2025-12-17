@@ -51,71 +51,22 @@ except ImportError:
     POLARS_AVAILABLE = False
 
 
-class ViewportLimits:
-    """Current viewport limits."""
-    def __init__(self, time_min=0.0, time_max=1000.0, x_min=0.0, x_max=100.0, y_min=0.0, y_max=100.0):
-        self.time_min = time_min
-        self.time_max = time_max
-        self.x_min = x_min
-        self.x_max = x_max
-        self.y_min = y_min
-        self.y_max = y_max
-
-
-class ViewportState(QObject):
-    """Manages synchronized viewport state across panels."""
-
-    limits_changed = pyqtSignal(object)  # ViewportLimits
-    amplitude_range_changed = pyqtSignal(float, float)
-    colormap_changed = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._limits = ViewportLimits()
-        self._min_amplitude = -1.0
-        self._max_amplitude = 1.0
-        self._colormap = 'seismic'
-
-    @property
-    def limits(self) -> ViewportLimits:
-        return self._limits
-
-    @property
-    def min_amplitude(self) -> float:
-        return self._min_amplitude
-
-    @property
-    def max_amplitude(self) -> float:
-        return self._max_amplitude
-
-    @property
-    def colormap(self) -> str:
-        return self._colormap
-
-    def set_limits(self, time_min: float, time_max: float, x_min: float, x_max: float):
-        self._limits = ViewportLimits(time_min, time_max, x_min, x_max)
-        self.limits_changed.emit(self._limits)
-
-    def set_amplitude_range(self, min_amp: float, max_amp: float):
-        self._min_amplitude = min_amp
-        self._max_amplitude = max_amp
-        self.amplitude_range_changed.emit(min_amp, max_amp)
-
-    def set_colormap(self, colormap: str):
-        self._colormap = colormap
-        self.colormap_changed.emit(colormap)
-
-
 class SeismicSliceViewer(QWidget):
     """Single slice viewer panel using PyQtGraph."""
 
-    def __init__(self, title: str, axis_labels: tuple = ('X', 'Y'), parent=None):
+    def __init__(self, title: str, axis_labels: tuple = ('X', 'Y'), parent=None, invert_y: bool = False):
         super().__init__(parent)
         self.title = title
         self.axis_labels = axis_labels
         self._data = None
         self._clip_percent = 99
         self._colormap = 'seismic'
+        self._invert_y = invert_y
+
+        # Mouse interaction state
+        self._initial_range = None
+        self._is_panning = False
+        self._pan_start = None
 
         self._init_ui()
 
@@ -151,13 +102,23 @@ class SeismicSliceViewer(QWidget):
         self.image_item = pg.ImageItem()
         self.plot_item.addItem(self.image_item)
 
+        # Invert Y axis if requested (for seismic time display: time 0 at top)
+        if self._invert_y:
+            self.plot_item.invertY(True)
+
         # Setup colormap
         self._apply_colormap('seismic')
 
         # Configure mouse
         self.view_box = self.plot_item.getViewBox()
         self.view_box.setMouseEnabled(x=True, y=True)
-        self.view_box.setMouseMode(pg.ViewBox.RectMode)
+        self.view_box.setMouseMode(pg.ViewBox.RectMode)  # Left mouse = zoom rectangle
+
+        # Install event filter for custom mouse handling
+        # - Middle mouse: pan/drag
+        # - Right click: reset to full view
+        self.graphics_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+        self.graphics_widget.viewport().installEventFilter(self)
 
         layout.addWidget(self.graphics_widget)
 
@@ -219,16 +180,7 @@ class SeismicSliceViewer(QWidget):
     def set_data(self, data: np.ndarray, clip_percent: float = 99,
                  x_axis: np.ndarray = None, y_axis: np.ndarray = None,
                  vmin: float = None, vmax: float = None):
-        """Set display data.
-
-        Args:
-            data: 2D array of amplitudes
-            clip_percent: Percentile for auto-clipping (used if vmin/vmax not set)
-            x_axis: X coordinate axis
-            y_axis: Y coordinate axis
-            vmin: Manual minimum value for color scale
-            vmax: Manual maximum value for color scale
-        """
+        """Set display data."""
         if not PYQTGRAPH_AVAILABLE or data is None:
             return
 
@@ -237,15 +189,13 @@ class SeismicSliceViewer(QWidget):
 
         # Determine scale range
         if vmin is not None and vmax is not None:
-            # Use manual min/max
             scale_min = vmin
             scale_max = vmax
         else:
-            # Auto-clip based on percentile
             valid_data = data[~np.isnan(data)]
             if valid_data.size > 0:
                 clip_val = np.percentile(np.abs(valid_data), clip_percent)
-                clip_val = max(clip_val, 1e-15)  # Prevent zero range
+                clip_val = max(clip_val, 1e-15)
             else:
                 clip_val = 1.0
             scale_min = -clip_val
@@ -254,7 +204,7 @@ class SeismicSliceViewer(QWidget):
         # Clip and normalize to 0-1 range for colormap
         scale_range = scale_max - scale_min
         if scale_range < 1e-15:
-            scale_range = 1e-15  # Prevent division by zero
+            scale_range = 1e-15
 
         display_data = np.clip(data, scale_min, scale_max)
         display_data = (display_data - scale_min) / scale_range
@@ -268,6 +218,8 @@ class SeismicSliceViewer(QWidget):
                 x_axis[0], y_axis[0],
                 x_axis[-1] - x_axis[0], y_axis[-1] - y_axis[0]
             )
+            # Store initial range for reset (after a short delay to let view settle)
+            self._store_initial_range(x_axis, y_axis)
 
     def set_colormap(self, colormap: str):
         """Change colormap."""
@@ -280,6 +232,84 @@ class SeismicSliceViewer(QWidget):
         if PYQTGRAPH_AVAILABLE:
             self.image_item.clear()
         self._data = None
+
+    def _store_initial_range(self, x_axis: np.ndarray, y_axis: np.ndarray):
+        """Store the initial view range for reset functionality."""
+        if not PYQTGRAPH_AVAILABLE:
+            return
+        # Store the data extents
+        self._initial_range = (
+            (float(x_axis[0]), float(x_axis[-1])),
+            (float(y_axis[0]), float(y_axis[-1]))
+        )
+        # Auto-range to fit data
+        self.view_box.autoRange()
+
+    def _on_mouse_clicked(self, event):
+        """Handle mouse click events - right click resets view."""
+        if not PYQTGRAPH_AVAILABLE:
+            return
+        # Check for right mouse button click
+        if event.button() == Qt.MouseButton.RightButton:
+            self.reset_view()
+
+    def eventFilter(self, obj, event):
+        """Event filter for middle mouse button panning."""
+        if not PYQTGRAPH_AVAILABLE:
+            return super().eventFilter(obj, event)
+
+        from PyQt6.QtCore import QEvent
+
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._is_panning = True
+                self._pan_start = event.pos()
+                return True
+
+        elif event.type() == QEvent.Type.MouseMove:
+            if self._is_panning and self._pan_start is not None:
+                # Calculate delta in view coordinates
+                delta = event.pos() - self._pan_start
+                self._pan_start = event.pos()
+
+                # Get current view range
+                vr = self.view_box.viewRange()
+                x_range = vr[0][1] - vr[0][0]
+                y_range = vr[1][1] - vr[1][0]
+
+                # Get widget size for scaling
+                widget_size = self.graphics_widget.size()
+
+                # Convert pixel delta to data coordinates
+                dx = -delta.x() * x_range / widget_size.width()
+                dy = delta.y() * y_range / widget_size.height()
+
+                # If Y is inverted, flip dy
+                if self._invert_y:
+                    dy = -dy
+
+                # Pan the view
+                self.view_box.translateBy(x=dx, y=dy)
+                return True
+
+        elif event.type() == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._is_panning = False
+                self._pan_start = None
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def reset_view(self):
+        """Reset view to show full data extent."""
+        if not PYQTGRAPH_AVAILABLE:
+            return
+
+        if self._initial_range is not None:
+            x_range, y_range = self._initial_range
+            self.view_box.setRange(xRange=x_range, yRange=y_range, padding=0.02)
+        else:
+            self.view_box.autoRange()
 
 
 class SpectrumPanel(QWidget):
@@ -338,7 +368,7 @@ class VisualizationStep(WizardStepWidget):
         header_frame, header_layout = self.create_section("Step 9: Visualization")
         desc = QLabel(
             "Interactive visualization of migration results. "
-            "View inline, crossline, and time slices. Analyze frequency content."
+            "View inline, crossline, and time slices."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet("color: #888888; border: none; background: transparent;")
@@ -347,349 +377,265 @@ class VisualizationStep(WizardStepWidget):
 
         # Initialize state
         self._data = None
+        self._stack_data = None  # Full stack data (kept separate)
         self._fold = None
         self._sample_rate_ms = 2.0
-        self._bin_headers = None  # Polars DataFrame from bin_headers.parquet
-        self._cig_data = None  # CIG volume if available
-        self._is_prestack = False  # Flag for prestack data
+        self._gathers_index = None
+        self._gather_headers = None
+        self._current_volume_id = "stack"  # "stack" or bin_id number
 
-        # Main content - horizontal splitter
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Main content area (takes most space)
+        main_widget = QWidget()
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(5)
 
-        # Left: Viewer panels
-        viewer_widget = self._create_viewer_panels()
-        main_splitter.addWidget(viewer_widget)
+        # Compact control bar at top
+        control_bar = self._create_control_bar()
+        main_layout.addWidget(control_bar)
 
-        # Right: Control panel
-        control_panel = self._create_control_panel()
-        main_splitter.addWidget(control_panel)
-
-        # Set splitter sizes (80% viewer, 20% controls)
-        main_splitter.setSizes([800, 200])
-
-        self.content_layout.addWidget(main_splitter, 1)
-
-    def _create_viewer_panels(self) -> QWidget:
-        """Create the viewer panels."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        # Create tabs for different view modes
+        # Tabs for different views
         self.view_tabs = QTabWidget()
 
-        # Tab 1: Slice Views (inline + time slice side by side)
-        slice_widget = QWidget()
-        slice_layout = QHBoxLayout(slice_widget)
-
-        # Vertical splitter for inline and crossline
-        left_splitter = QSplitter(Qt.Orientation.Vertical)
-
-        self.inline_viewer = SeismicSliceViewer("Inline Section", ('Crossline', 'Time (ms)'))
-        self.crossline_viewer = SeismicSliceViewer("Crossline Section", ('Inline', 'Time (ms)'))
-
-        left_splitter.addWidget(self.inline_viewer)
-        left_splitter.addWidget(self.crossline_viewer)
-
-        slice_layout.addWidget(left_splitter, 2)
-
-        # Time slice viewer
-        self.time_slice_viewer = SeismicSliceViewer("Time Slice", ('Inline', 'Crossline'))
-        slice_layout.addWidget(self.time_slice_viewer, 1)
-
-        self.view_tabs.addTab(slice_widget, "Slice Views")
+        # Tab 1: Slice Views (main view)
+        slice_widget = self._create_slice_views()
+        self.view_tabs.addTab(slice_widget, "Slices")
 
         # Tab 2: Spectrum Analysis
-        spectrum_widget = QWidget()
-        spectrum_layout = QVBoxLayout(spectrum_widget)
-
-        # Data viewer at top
-        self.spectrum_data_viewer = SeismicSliceViewer("Data (click trace for spectrum)", ('Trace', 'Time (ms)'))
-        spectrum_layout.addWidget(self.spectrum_data_viewer, 2)
-
-        # Spectrum at bottom
-        self.spectrum_panel = SpectrumPanel()
-        spectrum_layout.addWidget(self.spectrum_panel, 1)
-
-        self.view_tabs.addTab(spectrum_widget, "Spectrum Analysis")
+        spectrum_widget = self._create_spectrum_tab()
+        self.view_tabs.addTab(spectrum_widget, "Spectrum")
 
         # Tab 3: Fold Map
-        fold_widget = QWidget()
-        fold_layout = QVBoxLayout(fold_widget)
+        fold_widget = self._create_fold_tab()
+        self.view_tabs.addTab(fold_widget, "Fold")
 
-        self.fold_viewer = SeismicSliceViewer("Fold Map", ('Inline', 'Crossline'))
-        fold_layout.addWidget(self.fold_viewer)
+        main_layout.addWidget(self.view_tabs, 1)  # Give tabs all remaining space
 
-        self.view_tabs.addTab(fold_widget, "Fold Map")
+        self.content_layout.addWidget(main_widget, 1)
 
-        # Tab 4: Gathers (for prestack data)
-        gathers_widget = self._create_gathers_tab()
-        self.view_tabs.addTab(gathers_widget, "Gathers")
+    def _create_control_bar(self) -> QWidget:
+        """Create compact control bar with all settings."""
+        bar = QWidget()
+        bar.setMaximumHeight(90)
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(3)
 
-        layout.addWidget(self.view_tabs)
+        # Row 1: Volume selector, Load button, Data info
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
 
-        return widget
+        # Volume selector
+        row1.addWidget(QLabel("Volume:"))
+        self.volume_combo = QComboBox()
+        self.volume_combo.setMinimumWidth(200)
+        self.volume_combo.addItem("Full Stack", "stack")
+        self.volume_combo.currentIndexChanged.connect(self._on_volume_changed)
+        row1.addWidget(self.volume_combo)
 
-    def _create_gathers_tab(self) -> QWidget:
-        """Create the gathers visualization tab for prestack data."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        # Load button
+        load_btn = QPushButton("Load Data")
+        load_btn.setMaximumWidth(100)
+        load_btn.clicked.connect(self._load_data)
+        row1.addWidget(load_btn)
 
-        # Header with prestack status
-        self.gathers_status_label = QLabel("Loading...")
-        self.gathers_status_label.setStyleSheet("font-weight: bold; color: #888888;")
-        layout.addWidget(self.gathers_status_label)
+        # Data info label
+        self.info_label = QLabel("No data loaded")
+        self.info_label.setStyleSheet("color: #888888;")
+        row1.addWidget(self.info_label)
 
-        # Main content splitter
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        row1.addStretch()
 
-        # Left side: Map views (offset and azimuth)
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(row1)
 
-        # Map type selector
-        map_selector = QHBoxLayout()
-        map_label = QLabel("Display:")
-        self.offset_radio = QRadioButton("Offset")
-        self.offset_radio.setChecked(True)
-        self.azimuth_radio = QRadioButton("Azimuth")
-        self.trace_count_radio = QRadioButton("Trace Count")
+        # Row 2: Slice navigation
+        row2 = QHBoxLayout()
+        row2.setSpacing(15)
 
-        self.map_type_group = QButtonGroup()
-        self.map_type_group.addButton(self.offset_radio, 0)
-        self.map_type_group.addButton(self.azimuth_radio, 1)
-        self.map_type_group.addButton(self.trace_count_radio, 2)
-        self.map_type_group.buttonClicked.connect(self._on_gather_map_type_changed)
-
-        map_selector.addWidget(map_label)
-        map_selector.addWidget(self.offset_radio)
-        map_selector.addWidget(self.azimuth_radio)
-        map_selector.addWidget(self.trace_count_radio)
-        map_selector.addStretch()
-        left_layout.addLayout(map_selector)
-
-        # Offset/Azimuth map viewer
-        self.gather_map_viewer = SeismicSliceViewer("Bin Attributes", ('Inline', 'Crossline'))
-        left_layout.addWidget(self.gather_map_viewer)
-
-        splitter.addWidget(left_widget)
-
-        # Right side: Gather info panel and CIG viewer (if available)
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Location selection
-        loc_group = QGroupBox("Bin Selection")
-        loc_layout = QFormLayout(loc_group)
-
-        # Inline/Crossline selectors for gather location
-        self.gather_inline_spin = QSpinBox()
-        self.gather_inline_spin.setRange(0, 1000)
-        self.gather_inline_spin.valueChanged.connect(self._on_gather_location_changed)
-        loc_layout.addRow("Inline:", self.gather_inline_spin)
-
-        self.gather_crossline_spin = QSpinBox()
-        self.gather_crossline_spin.setRange(0, 1000)
-        self.gather_crossline_spin.valueChanged.connect(self._on_gather_location_changed)
-        loc_layout.addRow("Crossline:", self.gather_crossline_spin)
-
-        right_layout.addWidget(loc_group)
-
-        # Bin info display
-        info_group = QGroupBox("Bin Information")
-        info_layout = QVBoxLayout(info_group)
-
-        self.bin_info_label = QLabel("Select a bin to view information")
-        self.bin_info_label.setWordWrap(True)
-        self.bin_info_label.setStyleSheet("color: #cccccc; font-family: monospace;")
-        info_layout.addWidget(self.bin_info_label)
-
-        right_layout.addWidget(info_group)
-
-        # Statistics summary
-        stats_group = QGroupBox("Header Statistics")
-        stats_layout = QVBoxLayout(stats_group)
-
-        self.header_stats_label = QLabel("No prestack data loaded")
-        self.header_stats_label.setWordWrap(True)
-        self.header_stats_label.setStyleSheet("color: #888888;")
-        stats_layout.addWidget(self.header_stats_label)
-
-        right_layout.addWidget(stats_group)
-
-        # CIG viewer (if CIG data available)
-        cig_group = QGroupBox("Common Image Gather")
-        cig_layout = QVBoxLayout(cig_group)
-
-        self.cig_viewer = SeismicSliceViewer("CIG at Location", ('Offset Bin', 'Time (ms)'))
-        cig_layout.addWidget(self.cig_viewer)
-
-        self.cig_status_label = QLabel("CIG data not available")
-        self.cig_status_label.setStyleSheet("color: #888888;")
-        cig_layout.addWidget(self.cig_status_label)
-
-        right_layout.addWidget(cig_group)
-
-        splitter.addWidget(right_widget)
-        splitter.setSizes([500, 300])
-
-        layout.addWidget(splitter)
-
-        return widget
-
-    def _create_control_panel(self) -> QWidget:
-        """Create control panel."""
-        panel = QWidget()
-        panel.setMaximumWidth(300)
-        layout = QVBoxLayout(panel)
-
-        # Slice selection
-        slice_group = QGroupBox("Slice Selection")
-        slice_layout = QFormLayout(slice_group)
-
-        # Inline slider
+        # Inline
+        row2.addWidget(QLabel("Inline:"))
         self.inline_slider = QSlider(Qt.Orientation.Horizontal)
         self.inline_slider.setRange(0, 100)
         self.inline_slider.setValue(50)
+        self.inline_slider.setMaximumWidth(150)
         self.inline_slider.valueChanged.connect(self._on_inline_changed)
+        row2.addWidget(self.inline_slider)
         self.inline_label = QLabel("50")
-        inline_row = QHBoxLayout()
-        inline_row.addWidget(self.inline_slider)
-        inline_row.addWidget(self.inline_label)
-        slice_layout.addRow("Inline:", inline_row)
+        self.inline_label.setMinimumWidth(35)
+        row2.addWidget(self.inline_label)
 
-        # Crossline slider
+        # Crossline
+        row2.addWidget(QLabel("Crossline:"))
         self.crossline_slider = QSlider(Qt.Orientation.Horizontal)
         self.crossline_slider.setRange(0, 100)
         self.crossline_slider.setValue(50)
+        self.crossline_slider.setMaximumWidth(150)
         self.crossline_slider.valueChanged.connect(self._on_crossline_changed)
+        row2.addWidget(self.crossline_slider)
         self.crossline_label = QLabel("50")
-        crossline_row = QHBoxLayout()
-        crossline_row.addWidget(self.crossline_slider)
-        crossline_row.addWidget(self.crossline_label)
-        slice_layout.addRow("Crossline:", crossline_row)
+        self.crossline_label.setMinimumWidth(35)
+        row2.addWidget(self.crossline_label)
 
-        # Time slider
+        # Time
+        row2.addWidget(QLabel("Time:"))
         self.time_slider = QSlider(Qt.Orientation.Horizontal)
         self.time_slider.setRange(0, 4000)
         self.time_slider.setValue(2000)
+        self.time_slider.setMaximumWidth(150)
         self.time_slider.valueChanged.connect(self._on_time_changed)
+        row2.addWidget(self.time_slider)
         self.time_label = QLabel("2000 ms")
-        time_row = QHBoxLayout()
-        time_row.addWidget(self.time_slider)
-        time_row.addWidget(self.time_label)
-        slice_layout.addRow("Time:", time_row)
+        self.time_label.setMinimumWidth(55)
+        row2.addWidget(self.time_label)
 
-        layout.addWidget(slice_group)
+        row2.addStretch()
 
-        # Display settings
-        display_group = QGroupBox("Display Settings")
-        display_layout = QFormLayout(display_group)
+        layout.addLayout(row2)
+
+        # Row 3: Display settings
+        row3 = QHBoxLayout()
+        row3.setSpacing(15)
 
         # Colormap
+        row3.addWidget(QLabel("Colormap:"))
         self.colormap_combo = QComboBox()
         self.colormap_combo.addItems(['seismic', 'grayscale', 'viridis'])
+        self.colormap_combo.setMaximumWidth(100)
         self.colormap_combo.currentTextChanged.connect(self._on_colormap_changed)
-        display_layout.addRow("Colormap:", self.colormap_combo)
+        row3.addWidget(self.colormap_combo)
 
-        # Auto scale checkbox
+        # Auto scale
         self.auto_scale_check = QCheckBox("Auto Scale")
         self.auto_scale_check.setChecked(True)
         self.auto_scale_check.stateChanged.connect(self._on_auto_scale_changed)
-        display_layout.addRow("", self.auto_scale_check)
+        row3.addWidget(self.auto_scale_check)
 
-        # Clip percent (for auto mode)
+        # Clip percent
+        row3.addWidget(QLabel("Clip %:"))
         self.clip_spin = QSpinBox()
         self.clip_spin.setRange(90, 100)
         self.clip_spin.setValue(99)
+        self.clip_spin.setMaximumWidth(60)
         self.clip_spin.valueChanged.connect(self._update_all_views)
-        display_layout.addRow("Clip %:", self.clip_spin)
+        row3.addWidget(self.clip_spin)
 
-        # Min value (scientific notation)
+        # Scale min
+        row3.addWidget(QLabel("Min:"))
         self.scale_min_spin = QDoubleSpinBox()
         self.scale_min_spin.setRange(-1e15, 1e15)
         self.scale_min_spin.setDecimals(6)
         self.scale_min_spin.setValue(-1e-3)
+        self.scale_min_spin.setMaximumWidth(100)
         self.scale_min_spin.setEnabled(False)
         self.scale_min_spin.valueChanged.connect(self._update_all_views)
-        display_layout.addRow("Scale Min:", self.scale_min_spin)
+        row3.addWidget(self.scale_min_spin)
 
-        # Max value (scientific notation)
+        # Scale max
+        row3.addWidget(QLabel("Max:"))
         self.scale_max_spin = QDoubleSpinBox()
         self.scale_max_spin.setRange(-1e15, 1e15)
         self.scale_max_spin.setDecimals(6)
         self.scale_max_spin.setValue(1e-3)
+        self.scale_max_spin.setMaximumWidth(100)
         self.scale_max_spin.setEnabled(False)
         self.scale_max_spin.valueChanged.connect(self._update_all_views)
-        display_layout.addRow("Scale Max:", self.scale_max_spin)
+        row3.addWidget(self.scale_max_spin)
 
-        # Auto-detect button
-        self.auto_detect_btn = QPushButton("Detect Range")
-        self.auto_detect_btn.setEnabled(False)
-        self.auto_detect_btn.clicked.connect(self._detect_amplitude_range)
-        display_layout.addRow("", self.auto_detect_btn)
-
-        layout.addWidget(display_group)
-
-        # Data info
-        info_group = QGroupBox("Data Information")
-        info_layout = QVBoxLayout(info_group)
-
-        self.info_label = QLabel("No data loaded")
-        self.info_label.setWordWrap(True)
-        self.info_label.setStyleSheet("color: #888888;")
-        info_layout.addWidget(self.info_label)
-
-        layout.addWidget(info_group)
-
-        # Actions
-        actions_group = QGroupBox("Actions")
-        actions_layout = QVBoxLayout(actions_group)
-
-        load_btn = QPushButton("Load Migration Output")
-        load_btn.clicked.connect(self._load_data)
-        actions_layout.addWidget(load_btn)
-
-        reset_btn = QPushButton("Reset View")
+        # Reset view button
+        reset_btn = QPushButton("Reset")
+        reset_btn.setMaximumWidth(60)
         reset_btn.clicked.connect(self._reset_view)
-        actions_layout.addWidget(reset_btn)
+        row3.addWidget(reset_btn)
 
-        layout.addWidget(actions_group)
+        row3.addStretch()
 
-        layout.addStretch()
+        layout.addLayout(row3)
 
-        return panel
+        return bar
+
+    def _create_slice_views(self) -> QWidget:
+        """Create the main slice views panel."""
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Left side: Inline and Crossline (stacked vertically)
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Use invert_y=True for time axis to display time 0 at top (seismic convention)
+        self.inline_viewer = SeismicSliceViewer("Inline Section", ('Crossline', 'Time (ms)'), invert_y=True)
+        self.crossline_viewer = SeismicSliceViewer("Crossline Section", ('Inline', 'Time (ms)'), invert_y=True)
+
+        left_splitter.addWidget(self.inline_viewer)
+        left_splitter.addWidget(self.crossline_viewer)
+
+        layout.addWidget(left_splitter, 2)
+
+        # Right side: Time slice
+        self.time_slice_viewer = SeismicSliceViewer("Time Slice", ('Inline', 'Crossline'))
+        layout.addWidget(self.time_slice_viewer, 1)
+
+        return widget
+
+    def _create_spectrum_tab(self) -> QWidget:
+        """Create spectrum analysis tab."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # Data viewer at top (time 0 at top)
+        self.spectrum_data_viewer = SeismicSliceViewer("Data (click trace for spectrum)", ('Trace', 'Time (ms)'), invert_y=True)
+        layout.addWidget(self.spectrum_data_viewer, 2)
+
+        # Spectrum at bottom
+        self.spectrum_panel = SpectrumPanel()
+        layout.addWidget(self.spectrum_panel, 1)
+
+        return widget
+
+    def _create_fold_tab(self) -> QWidget:
+        """Create fold map tab."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        self.fold_viewer = SeismicSliceViewer("Fold Map", ('Inline', 'Crossline'))
+        layout.addWidget(self.fold_viewer)
+
+        return widget
 
     def _load_data(self) -> None:
         """Load migration output data."""
         output_dir = self.controller.state.output.output_dir
         if not output_dir:
+            self.info_label.setText("No output directory set")
             return
 
         output_path = Path(output_dir)
         stack_path = output_path / "migrated_stack.zarr"
         fold_path = output_path / "fold.zarr"
-        headers_path = output_path / "bin_headers.parquet"
-        cig_path = output_path / "cig.zarr"
+        gathers_index_path = output_path / "gathers_index.parquet"
+        gather_headers_path = output_path / "gather_headers.parquet"
 
-        if not stack_path.exists():
-            self.info_label.setText("No migration output found.\nRun migration first.")
+        # Check if any output exists (stack or gathers)
+        has_stack = stack_path.exists()
+        has_gathers = gathers_index_path.exists()
+
+        if not has_stack and not has_gathers:
+            self.info_label.setText("No migration output found. Run migration first.")
             return
 
         try:
-            # Load stack data
-            z = zarr.open(str(stack_path), mode='r')
-            if isinstance(z, zarr.Array):
-                self._data = np.array(z)
-            else:
-                # Handle group format
-                key = list(z.keys())[0] if z.keys() else None
-                if key:
-                    self._data = np.array(z[key])
+            # Load stack data if available
+            self._stack_data = None
+            if has_stack:
+                z = zarr.open(str(stack_path), mode='r')
+                if isinstance(z, zarr.Array):
+                    self._stack_data = np.array(z)
+                else:
+                    key = list(z.keys())[0] if z.keys() else None
+                    if key:
+                        self._stack_data = np.array(z[key])
 
-            # Load fold data
+            # Load fold data if available
             if fold_path.exists():
                 z_fold = zarr.open(str(fold_path), mode='r')
                 if isinstance(z_fold, zarr.Array):
@@ -699,85 +645,167 @@ class VisualizationStep(WizardStepWidget):
                     if key:
                         self._fold = np.array(z_fold[key])
 
-            # Load prestack bin headers if available
-            self._is_prestack = False
-            self._bin_headers = None
-            if headers_path.exists() and POLARS_AVAILABLE:
-                try:
-                    self._bin_headers = pl.read_parquet(str(headers_path))
-                    self._is_prestack = True
-                except Exception as e:
-                    print(f"Warning: Could not load bin headers: {e}")
+            # Load gathers index if available (offset-binned output)
+            self._gathers_index = None
+            self._gather_headers = None
 
-            # Load CIG data if available
-            self._cig_data = None
-            if cig_path.exists():
+            if has_gathers and POLARS_AVAILABLE:
                 try:
-                    from pstm.pipeline.cig import load_cig_from_zarr
-                    self._cig_data, _, self._cig_coords = load_cig_from_zarr(cig_path)
+                    self._gathers_index = pl.read_parquet(str(gathers_index_path))
+                    if gather_headers_path.exists():
+                        self._gather_headers = pl.read_parquet(str(gather_headers_path))
                 except Exception as e:
-                    print(f"Warning: Could not load CIG data: {e}")
+                    print(f"Warning: Could not load gathers index: {e}")
+
+            # Update volume selector
+            self._update_volume_selector()
+
+            # Set initial data - prefer stack if available, otherwise load first gather
+            if self._stack_data is not None:
+                self._data = self._stack_data
+                self._current_volume_id = "stack"
+            elif self._gathers_index is not None and len(self._gathers_index) > 0:
+                # Load first gather as initial data
+                first_row = self._gathers_index.row(0, named=True)
+                bin_id = first_row["bin_id"]
+                volume_path = first_row["volume_path"]
+                gather_path = output_path / volume_path
+
+                if gather_path.exists():
+                    z = zarr.open(str(gather_path), mode='r')
+                    if isinstance(z, zarr.Array):
+                        self._data = np.array(z)
+                    else:
+                        key = list(z.keys())[0] if z.keys() else None
+                        if key:
+                            self._data = np.array(z[key])
+                    self._current_volume_id = bin_id
+
+                    # Select first gather in combo
+                    self.volume_combo.setCurrentIndex(0)
 
             # Update sliders
             if self._data is not None:
-                nx, ny, nt = self._data.shape
-                self.inline_slider.setRange(0, nx - 1)
-                self.inline_slider.setValue(nx // 2)
-                self.crossline_slider.setRange(0, ny - 1)
-                self.crossline_slider.setValue(ny // 2)
+                self._setup_sliders_for_data()
 
-                # Get time range from output grid
+                # Build info string
+                nx, ny, nt = self._data.shape
                 t_min = self.controller.state.output_grid.t_min_ms
                 t_max = self.controller.state.output_grid.t_max_ms
-                self.time_slider.setRange(int(t_min), int(t_max))
-                self.time_slider.setValue(int((t_min + t_max) / 2))
-                self._sample_rate_ms = self.controller.state.output_grid.dt_ms
 
-                # Detect amplitude range
                 valid_data = self._data[~np.isnan(self._data)]
                 if valid_data.size > 0:
                     data_min = float(np.min(valid_data))
                     data_max = float(np.max(valid_data))
-                    # Clamp to valid range
                     data_min = max(data_min, -1e15)
                     data_max = min(data_max, 1e15)
                 else:
                     data_min, data_max = -1.0, 1.0
 
-                # Set initial scale values
                 self.scale_min_spin.setValue(data_min)
                 self.scale_max_spin.setValue(data_max)
 
-                # Update gather location spinboxes
-                self.gather_inline_spin.setRange(0, nx - 1)
-                self.gather_inline_spin.setValue(nx // 2)
-                self.gather_crossline_spin.setRange(0, ny - 1)
-                self.gather_crossline_spin.setValue(ny // 2)
+                n_gathers = len(self._gathers_index) if self._gathers_index is not None else 0
+                stack_info = "Stack" if has_stack else "Gathers only"
+                gather_info = f" | {n_gathers} offset bins" if n_gathers > 0 else ""
 
-                # Build info string
-                info_text = (
-                    f"Shape: {nx} x {ny} x {nt}\n"
-                    f"Time: {t_min:.0f} - {t_max:.0f} ms\n"
-                    f"Sample rate: {self._sample_rate_ms:.1f} ms\n"
-                    f"Amplitude: {data_min:.2e} to {data_max:.2e}"
+                self.info_label.setText(
+                    f"{stack_info} | Shape: {nx}x{ny}x{nt} | "
+                    f"Time: {t_min:.0f}-{t_max:.0f}ms | "
+                    f"Amp: {data_min:.2e} to {data_max:.2e}"
+                    f"{gather_info}"
                 )
-
-                if self._is_prestack:
-                    info_text += "\n\n✓ Prestack headers available"
-
-                if self._cig_data is not None:
-                    info_text += "\n✓ CIG gathers available"
-
-                self.info_label.setText(info_text)
 
                 # Update views
                 self._update_all_views()
 
-                # Update gathers tab
-                self._update_gathers_tab()
-
         except Exception as e:
-            self.info_label.setText(f"Error loading data:\n{e}")
+            self.info_label.setText(f"Error: {e}")
+
+    def _update_volume_selector(self) -> None:
+        """Update the volume selector combo box."""
+        self.volume_combo.blockSignals(True)
+        self.volume_combo.clear()
+
+        # Add Full Stack only if it exists
+        if self._stack_data is not None:
+            self.volume_combo.addItem("Full Stack", "stack")
+
+        # Add offset bins if available
+        if self._gathers_index is not None:
+            for row in self._gathers_index.iter_rows(named=True):
+                bin_id = row["bin_id"]
+                omin = row["offset_min"]
+                omax = row["offset_max"]
+                self.volume_combo.addItem(
+                    f"Offset {omin:.0f}-{omax:.0f}m",
+                    bin_id
+                )
+
+        self.volume_combo.blockSignals(False)
+
+    def _setup_sliders_for_data(self) -> None:
+        """Setup sliders based on current data dimensions."""
+        if self._data is None:
+            return
+
+        nx, ny, nt = self._data.shape
+
+        self.inline_slider.setRange(0, nx - 1)
+        self.inline_slider.setValue(nx // 2)
+        self.inline_label.setText(str(nx // 2))
+
+        self.crossline_slider.setRange(0, ny - 1)
+        self.crossline_slider.setValue(ny // 2)
+        self.crossline_label.setText(str(ny // 2))
+
+        t_min = self.controller.state.output_grid.t_min_ms
+        t_max = self.controller.state.output_grid.t_max_ms
+        self.time_slider.setRange(int(t_min), int(t_max))
+        self.time_slider.setValue(int((t_min + t_max) / 2))
+        self.time_label.setText(f"{int((t_min + t_max) / 2)} ms")
+
+        self._sample_rate_ms = self.controller.state.output_grid.dt_ms
+
+    def _on_volume_changed(self, index: int) -> None:
+        """Handle volume selection change."""
+        if index < 0:
+            return
+
+        volume_id = self.volume_combo.itemData(index)
+        self._current_volume_id = volume_id
+
+        if volume_id == "stack":
+            # Use full stack
+            self._data = self._stack_data
+        else:
+            # Load specific offset bin
+            if self._gathers_index is None:
+                return
+
+            bin_row = self._gathers_index.filter(pl.col("bin_id") == volume_id).row(0, named=True)
+            volume_path = bin_row["volume_path"]
+
+            output_dir = self.controller.state.output.output_dir
+            gather_path = Path(output_dir) / volume_path
+
+            if gather_path.exists():
+                try:
+                    z = zarr.open(str(gather_path), mode='r')
+                    if isinstance(z, zarr.Array):
+                        self._data = np.array(z)
+                    else:
+                        key = list(z.keys())[0] if z.keys() else None
+                        if key:
+                            self._data = np.array(z[key])
+                except Exception as e:
+                    print(f"Error loading gather volume: {e}")
+                    return
+
+        # Update sliders and views
+        if self._data is not None:
+            self._setup_sliders_for_data()
+            self._update_all_views()
 
     def _on_inline_changed(self, value: int) -> None:
         """Handle inline slider change."""
@@ -799,7 +827,8 @@ class VisualizationStep(WizardStepWidget):
     def _on_colormap_changed(self, colormap: str) -> None:
         """Handle colormap change."""
         for viewer in [self.inline_viewer, self.crossline_viewer,
-                       self.time_slice_viewer, self.spectrum_data_viewer]:
+                       self.time_slice_viewer, self.spectrum_data_viewer,
+                       self.fold_viewer]:
             viewer.set_colormap(colormap)
 
     def _on_auto_scale_changed(self, state: int) -> None:
@@ -808,36 +837,7 @@ class VisualizationStep(WizardStepWidget):
         self.clip_spin.setEnabled(is_auto)
         self.scale_min_spin.setEnabled(not is_auto)
         self.scale_max_spin.setEnabled(not is_auto)
-        self.auto_detect_btn.setEnabled(not is_auto)
         self._update_all_views()
-
-    def _detect_amplitude_range(self) -> None:
-        """Auto-detect amplitude range from data."""
-        if self._data is None:
-            return
-
-        valid_data = self._data[~np.isnan(self._data)]
-        if valid_data.size == 0:
-            return
-
-        data_min = float(np.min(valid_data))
-        data_max = float(np.max(valid_data))
-
-        # Clamp to valid range
-        data_min = max(data_min, -1e15)
-        data_max = min(data_max, 1e15)
-
-        # Ensure min < max
-        if data_min >= data_max:
-            data_max = data_min + 1e-15
-
-        self.scale_min_spin.setValue(data_min)
-        self.scale_max_spin.setValue(data_max)
-
-        # Update info label with detected range
-        self.info_label.setText(
-            self.info_label.text() + f"\nRange: {data_min:.2e} to {data_max:.2e}"
-        )
 
     def _get_scale_params(self) -> tuple:
         """Get current scale parameters (vmin, vmax or None for auto)."""
@@ -862,10 +862,8 @@ class VisualizationStep(WizardStepWidget):
         if inline_idx >= self._data.shape[0]:
             return
 
-        # Extract inline slice (crossline x time)
         slice_data = self._data[inline_idx, :, :]
 
-        # Create axes
         ny, nt = slice_data.shape
         y_axis = np.arange(ny)
         t_axis = np.linspace(
@@ -886,10 +884,8 @@ class VisualizationStep(WizardStepWidget):
         if crossline_idx >= self._data.shape[1]:
             return
 
-        # Extract crossline slice (inline x time)
         slice_data = self._data[:, crossline_idx, :]
 
-        # Create axes
         nx, nt = slice_data.shape
         x_axis = np.arange(nx)
         t_axis = np.linspace(
@@ -911,14 +907,11 @@ class VisualizationStep(WizardStepWidget):
         t_max = self.controller.state.output_grid.t_max_ms
         nt = self._data.shape[2]
 
-        # Convert time to index
         time_idx = int((time_ms - t_min) / (t_max - t_min) * (nt - 1))
         time_idx = max(0, min(time_idx, nt - 1))
 
-        # Extract time slice (inline x crossline)
         slice_data = self._data[:, :, time_idx]
 
-        # Create axes
         nx, ny = slice_data.shape
         x_axis = np.arange(nx)
         y_axis = np.arange(ny)
@@ -937,180 +930,6 @@ class VisualizationStep(WizardStepWidget):
 
         self.fold_viewer.set_data(self._fold.astype(np.float32), 100, x_axis, y_axis)
 
-    def _update_gathers_tab(self) -> None:
-        """Update the gathers tab with prestack information."""
-        if not self._is_prestack or self._bin_headers is None:
-            self.gathers_status_label.setText(
-                "No prestack data available.\n"
-                "Run migration with 'Output Gathers' enabled to generate prestack headers."
-            )
-            self.gathers_status_label.setStyleSheet("color: #ff8888;")
-            self.header_stats_label.setText("No prestack headers found")
-            return
-
-        # Update status
-        self.gathers_status_label.setText("✓ Prestack migration data detected")
-        self.gathers_status_label.setStyleSheet("color: #88ff88; font-weight: bold;")
-
-        # Compute statistics from bin headers
-        df = self._bin_headers
-        n_bins = len(df)
-
-        offset_min = df["offset_avg"].min()
-        offset_max = df["offset_avg"].max()
-        offset_mean = df["offset_avg"].mean()
-
-        azimuth_min = df["azimuth_avg"].min()
-        azimuth_max = df["azimuth_avg"].max()
-
-        trace_count_total = df["trace_count"].sum()
-        trace_count_mean = df["trace_count"].mean()
-        trace_count_max = df["trace_count"].max()
-
-        stats_text = (
-            f"Bins with data: {n_bins:,}\n"
-            f"Total traces: {trace_count_total:,}\n"
-            f"Traces/bin: {trace_count_mean:.1f} (max: {trace_count_max})\n\n"
-            f"Offset range: {offset_min:.0f} - {offset_max:.0f} m\n"
-            f"Mean offset: {offset_mean:.0f} m\n\n"
-            f"Azimuth range: {azimuth_min:.1f}° - {azimuth_max:.1f}°"
-        )
-        self.header_stats_label.setText(stats_text)
-        self.header_stats_label.setStyleSheet("color: #cccccc;")
-
-        # Update CIG status
-        if self._cig_data is not None:
-            n_offsets = self._cig_data.shape[3] if len(self._cig_data.shape) > 3 else 0
-            self.cig_status_label.setText(f"✓ CIG available ({n_offsets} offset bins)")
-            self.cig_status_label.setStyleSheet("color: #88ff88;")
-        else:
-            self.cig_status_label.setText(
-                "CIG volume not available.\n"
-                "Re-run migration with CIG output enabled."
-            )
-            self.cig_status_label.setStyleSheet("color: #888888;")
-
-        # Update the map view
-        self._update_gather_map_view()
-
-        # Update bin info for current location
-        self._on_gather_location_changed()
-
-    def _on_gather_map_type_changed(self) -> None:
-        """Handle change in gather map display type."""
-        self._update_gather_map_view()
-
-    def _update_gather_map_view(self) -> None:
-        """Update the gather attribute map view."""
-        if self._bin_headers is None or self._data is None:
-            return
-
-        nx, ny, _ = self._data.shape
-        df = self._bin_headers
-
-        # Determine which attribute to display
-        if self.offset_radio.isChecked():
-            attr_col = "offset_avg"
-            title = "Average Offset (m)"
-        elif self.azimuth_radio.isChecked():
-            attr_col = "azimuth_avg"
-            title = "Average Azimuth (°)"
-        else:  # trace_count
-            attr_col = "trace_count"
-            title = "Trace Count"
-
-        # Create 2D grid from sparse parquet data
-        grid = np.zeros((nx, ny), dtype=np.float32)
-
-        # Fill grid with values from bin headers
-        ix_arr = df["ix"].to_numpy()
-        iy_arr = df["iy"].to_numpy()
-        val_arr = df[attr_col].to_numpy()
-
-        # Ensure indices are within bounds
-        valid_mask = (ix_arr < nx) & (iy_arr < ny)
-        ix_valid = ix_arr[valid_mask]
-        iy_valid = iy_arr[valid_mask]
-        val_valid = val_arr[valid_mask]
-
-        grid[ix_valid, iy_valid] = val_valid
-
-        # Create axes
-        x_axis = np.arange(nx)
-        y_axis = np.arange(ny)
-
-        # Use viridis for attribute maps
-        self.gather_map_viewer.set_colormap('viridis')
-        self.gather_map_viewer.set_data(grid, 100, x_axis, y_axis)
-        self.gather_map_viewer.title = title
-
-    def _on_gather_location_changed(self) -> None:
-        """Handle change in gather location selection."""
-        if self._bin_headers is None:
-            return
-
-        ix = self.gather_inline_spin.value()
-        iy = self.gather_crossline_spin.value()
-
-        # Find bin info at this location
-        df = self._bin_headers
-        bin_data = df.filter((pl.col("ix") == ix) & (pl.col("iy") == iy))
-
-        if len(bin_data) == 0:
-            self.bin_info_label.setText(
-                f"Bin ({ix}, {iy}): No data\n\n"
-                "This bin has no traces contributing to migration."
-            )
-            self.cig_viewer.clear()
-            return
-
-        # Extract values
-        row = bin_data.row(0, named=True)
-        x_coord = row["x"]
-        y_coord = row["y"]
-        trace_count = row["trace_count"]
-        offset_avg = row["offset_avg"]
-        azimuth_avg = row["azimuth_avg"]
-
-        info_text = (
-            f"Bin: ({ix}, {iy})\n"
-            f"Coordinates: ({x_coord:.1f}, {y_coord:.1f})\n\n"
-            f"Trace count: {trace_count}\n"
-            f"Avg offset: {offset_avg:.1f} m\n"
-            f"Avg azimuth: {azimuth_avg:.1f}°"
-        )
-        self.bin_info_label.setText(info_text)
-
-        # Update CIG viewer if data available
-        self._update_cig_view(ix, iy)
-
-    def _update_cig_view(self, ix: int, iy: int) -> None:
-        """Update CIG viewer for the selected bin location."""
-        if self._cig_data is None:
-            self.cig_viewer.clear()
-            return
-
-        # CIG shape: (nx, ny, nt, n_offset_bins)
-        if ix >= self._cig_data.shape[0] or iy >= self._cig_data.shape[1]:
-            self.cig_viewer.clear()
-            return
-
-        # Extract gather at this location: (nt, n_offset_bins)
-        gather = self._cig_data[ix, iy, :, :]
-
-        # Create axes
-        nt, n_offsets = gather.shape
-        t_axis = np.linspace(
-            self.controller.state.output_grid.t_min_ms,
-            self.controller.state.output_grid.t_max_ms,
-            nt
-        )
-        offset_axis = np.arange(n_offsets)
-
-        # Display with seismic colormap
-        self.cig_viewer.set_colormap('seismic')
-        self.cig_viewer.set_data(gather.T, 99, offset_axis, t_axis)
-
     def _reset_view(self) -> None:
         """Reset view to defaults."""
         if self._data is not None:
@@ -1124,7 +943,6 @@ class VisualizationStep(WizardStepWidget):
 
     def on_enter(self) -> None:
         """Called when navigating to this step."""
-        # Auto-load data if available
         output_dir = self.controller.state.output.output_dir
         if output_dir:
             output_path = Path(output_dir)

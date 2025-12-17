@@ -59,14 +59,22 @@ class WizardStepWidget(QWidget):
     def on_enter(self) -> None:
         """Called when navigating to this step."""
         pass
-    
+
     def on_leave(self) -> None:
         """Called when navigating away from this step."""
         pass
-    
+
     def validate(self) -> bool:
         """Validate the step is complete/valid."""
         return True
+
+    def refresh_from_state(self) -> None:
+        """Refresh UI widgets from controller state.
+
+        Called when state is loaded from file. Subclasses should override
+        to update their widgets to match the loaded state.
+        """
+        pass
     
     def create_section(self, title: str) -> tuple[QFrame, QVBoxLayout]:
         """Create a styled section with title."""

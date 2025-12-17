@@ -1096,3 +1096,40 @@ class ExecutionStep(WizardStepWidget):
             self.cleanup()
 
         event.accept()
+
+    def refresh_from_state(self) -> None:
+        """Refresh UI from loaded state."""
+        # Output state
+        output_state = self.controller.state.output
+        self.output_dir_edit.setText(output_state.output_dir or "")
+        self.project_name_edit.setText(output_state.project_name or "")
+        self.output_stacked_check.setChecked(output_state.output_stacked_image)
+        self.output_fold_check.setChecked(output_state.output_fold_map)
+        self.output_cig_check.setChecked(output_state.output_cig)
+        self.output_qc_check.setChecked(output_state.output_qc_report)
+
+        format_map = {"zarr": 0, "segy": 1}
+        self.output_format_combo.setCurrentIndex(format_map.get(output_state.output_format, 0))
+
+        # Execution state
+        state = self.controller.state.execution
+
+        backend_values = [opt[1] for opt in self._backend_options]
+        idx = backend_values.index(state.backend) if state.backend in backend_values else 0
+        self.backend_combo.setCurrentIndex(idx)
+
+        self.max_memory_spin.setValue(state.max_memory_gb)
+        self.n_threads_spin.setValue(state.n_threads)
+
+        self.auto_tile_check.setChecked(state.auto_tile_size)
+        self.tile_nx_spin.setValue(state.tile_nx)
+        self.tile_ny_spin.setValue(state.tile_ny)
+
+        orders = ["snake", "row_major", "column_major", "hilbert"]
+        if state.tile_ordering in orders:
+            self.tile_order_combo.setCurrentIndex(orders.index(state.tile_ordering))
+
+        self.enable_checkpoint.setChecked(state.enable_checkpoint)
+        self.checkpoint_tiles_spin.setValue(state.checkpoint_interval_tiles)
+        self.checkpoint_seconds_spin.setValue(int(state.checkpoint_interval_seconds))
+        self.resume_check.setChecked(state.resume_from_checkpoint)

@@ -538,3 +538,7 @@ class DataSelectionStep(WizardStepWidget):
         if mode != "all":
             return self.ack_checkbox.isChecked()
         return True
+
+    def refresh_from_state(self) -> None:
+        """Refresh UI from loaded state."""
+        self._load_state_to_ui()

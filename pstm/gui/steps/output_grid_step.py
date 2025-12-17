@@ -111,6 +111,7 @@ class OutputGridStep(WizardStepWidget):
         left_layout.setContentsMargins(0, 0, 10, 0)
         
         self._create_method_section(left_layout)
+        self._create_azimuth_section(left_layout)
         self._create_corners_section(left_layout)
         self._create_binsize_section(left_layout)
         self._create_time_section(left_layout)
@@ -148,9 +149,51 @@ class OutputGridStep(WizardStepWidget):
         layout.addWidget(self.bounds_radio)
         
         self.method_group.idToggled.connect(self._on_method_changed)
-        
+
         parent_layout.addWidget(group)
-    
+
+    def _create_azimuth_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create grid azimuth/rotation control section."""
+        group = QGroupBox("Grid Azimuth / Rotation")
+        layout = QVBoxLayout(group)
+
+        desc = QLabel(
+            "Grid azimuth defines the rotation of the output grid relative to North (Y-axis). "
+            "Auto-detect calculates the acquisition azimuth from midpoint distribution."
+        )
+        desc.setWordWrap(True)
+        desc.setObjectName("sectionDescription")
+        layout.addWidget(desc)
+
+        # Azimuth control row
+        azimuth_layout = QHBoxLayout()
+
+        azimuth_layout.addWidget(QLabel("Azimuth:"))
+
+        self.azimuth_spin = QDoubleSpinBox()
+        self.azimuth_spin.setRange(0, 180)
+        self.azimuth_spin.setValue(0)
+        self.azimuth_spin.setDecimals(1)
+        self.azimuth_spin.setSuffix("°")
+        self.azimuth_spin.setMinimumWidth(100)
+        self.azimuth_spin.setToolTip("Grid rotation from North (Y-axis), clockwise positive")
+        self.azimuth_spin.valueChanged.connect(self._on_azimuth_changed)
+        azimuth_layout.addWidget(self.azimuth_spin)
+
+        self.auto_azimuth_btn = QPushButton("Auto-Detect")
+        self.auto_azimuth_btn.setToolTip("Calculate acquisition azimuth from midpoint distribution (PCA)")
+        self.auto_azimuth_btn.clicked.connect(self._auto_detect_azimuth)
+        azimuth_layout.addWidget(self.auto_azimuth_btn)
+
+        self.azimuth_info_label = QLabel("")
+        self.azimuth_info_label.setStyleSheet("color: #888; font-size: 11px;")
+        azimuth_layout.addWidget(self.azimuth_info_label)
+
+        azimuth_layout.addStretch()
+        layout.addLayout(azimuth_layout)
+
+        parent_layout.addWidget(group)
+
     def _create_corners_section(self, parent_layout: QVBoxLayout) -> None:
         """Create corner points input section."""
         group = QGroupBox("Corner Point Coordinates")
@@ -360,9 +403,53 @@ class OutputGridStep(WizardStepWidget):
         # Toggle corner point inputs based on method
         is_corner_method = button_id == 0
         self.corners_group.setEnabled(is_corner_method)
-    
+
+    def _auto_detect_azimuth(self) -> None:
+        """Auto-detect acquisition azimuth from midpoint distribution."""
+        azimuth = self.controller.compute_acquisition_azimuth()
+        if azimuth is not None:
+            self.azimuth_spin.setValue(azimuth)
+            self.azimuth_info_label.setText(f"(detected: {azimuth:.1f}°)")
+        else:
+            self._show_warning(
+                "Could not calculate acquisition azimuth. "
+                "Please ensure header data is loaded with valid coordinates."
+            )
+
+    def _on_azimuth_changed(self) -> None:
+        """Handle azimuth value change - update corners if extent was set."""
+        # If corners are currently set to a valid grid, recalculate with new azimuth
+        c1 = self.corner1.get_point()
+        c2 = self.corner2.get_point()
+        if c1 != (0, 0) or c2 != (0, 0):
+            # Corners are set - just update the display/preview
+            self._on_grid_changed()
+
+    def _apply_azimuth_to_corners(self, use_midpoints: bool = True) -> bool:
+        """Apply current azimuth to compute rotated corners from survey data.
+
+        Args:
+            use_midpoints: If True, use midpoint extent; otherwise use source/receiver extent
+
+        Returns:
+            True if successful, False otherwise
+        """
+        azimuth = self.azimuth_spin.value()
+        corners = self.controller.compute_rotated_extent(azimuth, use_midpoints=use_midpoints)
+
+        if corners is None:
+            return False
+
+        c1, c2, c3, c4 = corners
+        self.corner1.set_point(c1[0], c1[1])
+        self.corner2.set_point(c2[0], c2[1])
+        self.corner3.set_point(c3[0], c3[1])
+        self.corner4.set_point(c4[0], c4[1])
+
+        return True
+
     def _copy_from_survey(self) -> None:
-        """Copy grid corners from survey extent."""
+        """Copy grid corners from survey extent with rotation."""
         geom = self.controller.state.survey
 
         # Check if survey data is valid
@@ -376,15 +463,25 @@ class OutputGridStep(WizardStepWidget):
             )
             return
 
-        self.corner1.set_point(geom.x_min, geom.y_min)
-        self.corner2.set_point(geom.x_max, geom.y_min)
-        self.corner3.set_point(geom.x_max, geom.y_max)
-        self.corner4.set_point(geom.x_min, geom.y_max)
+        # Auto-detect azimuth if not set
+        if self.azimuth_spin.value() == 0:
+            azimuth = self.controller.compute_acquisition_azimuth()
+            if azimuth is not None:
+                self.azimuth_spin.setValue(azimuth)
+                self.azimuth_info_label.setText(f"(detected: {azimuth:.1f}°)")
+
+        # Compute rotated corners using source/receiver extent
+        if not self._apply_azimuth_to_corners(use_midpoints=False):
+            # Fallback to axis-aligned if rotation fails
+            self.corner1.set_point(geom.x_min, geom.y_min)
+            self.corner2.set_point(geom.x_max, geom.y_min)
+            self.corner3.set_point(geom.x_max, geom.y_max)
+            self.corner4.set_point(geom.x_min, geom.y_max)
 
         self._on_grid_changed()
 
     def _copy_from_midpoints(self) -> None:
-        """Copy grid corners from calculated midpoint extent."""
+        """Copy grid corners from calculated midpoint extent with rotation."""
         try:
             # Get midpoint extent from controller
             stats = self.controller.get_header_statistics()
@@ -401,10 +498,20 @@ class OutputGridStep(WizardStepWidget):
                 self._show_warning("Invalid midpoint extent in header data.")
                 return
 
-            self.corner1.set_point(mx_min, my_min)
-            self.corner2.set_point(mx_max, my_min)
-            self.corner3.set_point(mx_max, my_max)
-            self.corner4.set_point(mx_min, my_max)
+            # Auto-detect azimuth if not set
+            if self.azimuth_spin.value() == 0:
+                azimuth = self.controller.compute_acquisition_azimuth()
+                if azimuth is not None:
+                    self.azimuth_spin.setValue(azimuth)
+                    self.azimuth_info_label.setText(f"(detected: {azimuth:.1f}°)")
+
+            # Compute rotated corners using midpoint extent
+            if not self._apply_azimuth_to_corners(use_midpoints=True):
+                # Fallback to axis-aligned if rotation fails
+                self.corner1.set_point(mx_min, my_min)
+                self.corner2.set_point(mx_max, my_min)
+                self.corner3.set_point(mx_max, my_max)
+                self.corner4.set_point(mx_min, my_max)
 
             self._on_grid_changed()
 
@@ -606,27 +713,31 @@ class OutputGridStep(WizardStepWidget):
     def validate(self) -> bool:
         """Validate step data."""
         self._validation_errors = []
-        
+
         # Check corners form a valid quadrilateral
         c1 = self.corner1.get_point()
         c2 = self.corner2.get_point()
         c3 = self.corner3.get_point()
         c4 = self.corner4.get_point()
-        
+
         if c1 == c2 == c3 == c4 == (0, 0):
             self._validation_errors.append("Please define output grid corners")
-        
+
         if self.dx_spin.value() <= 0:
             self._validation_errors.append("Inline bin size must be positive")
-        
+
         if self.dy_spin.value() <= 0:
             self._validation_errors.append("Crossline bin size must be positive")
-        
+
         if self.t_max_spin.value() <= self.t_min_spin.value():
             self._validation_errors.append("End time must be greater than start time")
-        
+
         if self._validation_errors:
             self.show_validation_errors()
             return False
-        
+
         return True
+
+    def refresh_from_state(self) -> None:
+        """Refresh UI from loaded state."""
+        self.load_from_model()

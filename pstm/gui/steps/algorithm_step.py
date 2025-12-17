@@ -316,3 +316,22 @@ Recommendation:
         if self.max_dip_spin.value() <= 0:
             return False
         return True
+
+    def refresh_from_state(self) -> None:
+        """Refresh UI from loaded state."""
+        state = self.controller.state.algorithm
+
+        self.max_dip_spin.setValue(state.max_dip_degrees)
+        self.min_aperture_spin.setValue(state.min_aperture_m)
+        self.max_aperture_spin.setValue(state.max_aperture_m)
+        self.taper_type.setCurrentText(state.taper_type.title())
+        self.taper_fraction.setValue(state.taper_fraction)
+
+        for i in range(self.interp_method.count()):
+            if state.interpolation_method in self.interp_method.itemText(i):
+                self.interp_method.setCurrentIndex(i)
+                break
+
+        self.apply_spreading.setChecked(state.apply_spreading)
+        self.apply_obliquity.setChecked(state.apply_obliquity)
+        self.enable_aa.setChecked(state.enable_antialiasing)

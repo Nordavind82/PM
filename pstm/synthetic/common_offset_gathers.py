@@ -603,15 +603,16 @@ def export_to_zarr_parquet(
     """
     Export synthetic data to Zarr (traces) and Parquet (headers).
 
-    Uses the standard PSTM data format compatible with the UI wizard:
-    - Zarr: 2D array (n_traces, n_samples) with attributes for sample_rate_ms, start_time_ms
-    - Parquet: Headers with columns trace_idx, SOU_X, SOU_Y, REC_X, REC_Y, CDP_X, CDP_Y, OFFSET, AZIMUTH
+    Uses the standard PSTM/SeisProc data format:
+    - traces.zarr: 2D array (n_traces, n_samples) with attributes
+    - headers.parquet: Headers with standard column names
+    - metadata.json: Dataset metadata
 
     Args:
         result: Synthetic gather result
-        output_dir: Output directory
-        traces_name: Name for traces Zarr file
-        headers_name: Name for headers Parquet file
+        output_dir: Output directory (the "dataset directory")
+        traces_name: Name for traces Zarr file (default: traces.zarr)
+        headers_name: Name for headers Parquet file (default: headers.parquet)
         compression: Compression for Zarr (default: blosc)
 
     Returns:
@@ -667,16 +668,26 @@ def export_to_zarr_parquet(
         additional_columns=additional_columns,
     )
 
-    # Optionally save supplementary metadata as JSON (for reference)
+    # Save metadata.json (standard dataset metadata file)
     metadata = {
         'n_traces': result.n_traces,
         'n_samples': result.n_samples,
+        'sample_rate_ms': result.dt_ms,
         'dt_ms': result.dt_ms,
         't_start_ms': result.t_start_ms,
         'velocity_ms': result.velocity_ms,
         'format': 'pstm_zarr_parquet',
+        'synthetic': True,
+        'diffractors': [
+            {'x': d.x, 'y': d.y, 'z': d.z, 'amplitude': d.amplitude}
+            for d in result.config.diffractors
+        ],
+        'offset_azimuth_planes': [
+            {'offset': p.offset, 'azimuth_deg': p.azimuth_deg, 'name': p.name}
+            for p in result.config.offset_azimuth_planes
+        ],
     }
-    metadata_path = output_dir / f"{traces_name.replace('.zarr', '')}_metadata.json"
+    metadata_path = output_dir / "metadata.json"
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 

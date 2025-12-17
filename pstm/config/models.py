@@ -176,9 +176,17 @@ class InputConfig(BaseConfig):
         default=None,
         description="Number of samples per trace (auto-detected if None)",
     )
+    num_traces: PositiveInt | None = Field(
+        default=None,
+        description="Number of traces (auto-detected if None)",
+    )
     start_time_ms: float | None = Field(
         default=None,
         description="Recording start time in ms (auto-detected if None)",
+    )
+    transposed: bool = Field(
+        default=False,
+        description="True if traces stored as (n_samples, n_traces) instead of (n_traces, n_samples)",
     )
 
     @field_validator("traces_path", "headers_path")
@@ -488,6 +496,15 @@ class OutputProductsConfig(BaseConfig):
     cig_offset_bins: list[float] | None = Field(
         default=None,
         description="Offset bin centers for CIGs (meters)",
+    )
+    # Offset/azimuth gather output bins
+    output_gathers: bool = Field(
+        default=False,
+        description="Output separate migrated volumes per offset/azimuth bin",
+    )
+    gather_offset_ranges: list[tuple[float, float]] | None = Field(
+        default=None,
+        description="List of (min, max) offset ranges defining output gather bins (meters)",
     )
     semblance_panels: bool = Field(
         default=False,

@@ -180,10 +180,10 @@ def example_4_export_data():
 
 
     result = create_simple_synthetic(
-        diffractor_x=1000.0,      # Diffractor X position (m)
-        diffractor_y=1000.0,      # Diffractor Y position (m)
+        diffractor_x=2000.0,      # Diffractor X position (m)
+        diffractor_y=2000.0,      # Diffractor Y position (m)
         diffractor_z=800.0,       # Diffractor depth (m)
-        survey_extent=2000.0,     # Survey area: 2km x 2km
+        survey_extent=4000.0,     # Survey area: 2km x 2km
         grid_spacing=25.0,        # Midpoint spacing: 25m
         offsets=[200, 400],      # Two offset values (m)
         azimuths=[0, 360],         # Two azimuths (North, East)

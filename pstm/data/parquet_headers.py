@@ -203,18 +203,51 @@ class ParquetHeaderManager:
             self._n_traces = self._lazy_frame.select(pl.len()).collect().item()
         return self._n_traces
 
-    def _apply_scalar_if_needed(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Apply coordinate scalar if configured."""
-        if not self.apply_scalar or self.scalar_column is None:
-            return df
+    def _apply_scalar_if_needed(
+        self,
+        df: pl.DataFrame,
+        coord_arrays: dict[str, NDArray[np.float64]] | None = None,
+    ) -> pl.DataFrame | dict[str, NDArray[np.float64]]:
+        """
+        Apply coordinate scalar if configured.
 
-        if self.scalar_column not in df.columns:
-            return df
+        Args:
+            df: DataFrame containing data (and optionally scalar column)
+            coord_arrays: If provided, apply scalar to these arrays instead of df columns
 
-        # Get scalar values
-        scalars = df[self.scalar_column].to_numpy()
+        Returns:
+            Modified DataFrame or dict of scaled arrays
+        """
+        if not self.apply_scalar:
+            return coord_arrays if coord_arrays is not None else df
 
-        # Apply to coordinate columns
+        # Determine scalar value - either from df column or from stored value
+        scalar_value = None
+
+        if self.scalar_column and self.scalar_column in df.columns:
+            # Get first scalar value (typically constant for whole dataset)
+            scalar_value = int(df[self.scalar_column][0])
+            logger.debug(f"Using scalar from column {self.scalar_column}: {scalar_value}")
+        elif hasattr(self, '_cached_scalar') and self._cached_scalar is not None:
+            scalar_value = self._cached_scalar
+            logger.debug(f"Using cached scalar: {scalar_value}")
+
+        if scalar_value is None or scalar_value == 0 or scalar_value == 1:
+            return coord_arrays if coord_arrays is not None else df
+
+        # Cache the scalar for future use
+        self._cached_scalar = scalar_value
+
+        # If we have coord_arrays, apply directly to them
+        if coord_arrays is not None:
+            for key in coord_arrays:
+                if scalar_value > 0:
+                    coord_arrays[key] = coord_arrays[key] * scalar_value
+                else:
+                    coord_arrays[key] = coord_arrays[key] / abs(scalar_value)
+            return coord_arrays
+
+        # Apply to DataFrame columns (vectorized)
         coord_cols = [
             self.columns.source_x,
             self.columns.source_y,
@@ -224,11 +257,14 @@ class ParquetHeaderManager:
 
         for col in coord_cols:
             if col in df.columns:
-                values = df[col].to_numpy().astype(np.float64)
-                # Apply scalar element-wise (each trace may have different scalar)
-                for i, scalar in enumerate(scalars):
-                    values[i] = apply_seg_y_scalar(values[i], int(scalar))
-                df = df.with_columns(pl.Series(col, values))
+                if scalar_value > 0:
+                    df = df.with_columns(
+                        (pl.col(col).cast(pl.Float64) * scalar_value).alias(col)
+                    )
+                else:
+                    df = df.with_columns(
+                        (pl.col(col).cast(pl.Float64) / abs(scalar_value)).alias(col)
+                    )
 
         return df
 
@@ -278,6 +314,10 @@ class ParquetHeaderManager:
         # Include offset if available
         if self.columns.offset and self.columns.offset in self.schema:
             select_cols.append(self.columns.offset)
+
+        # Include scalar column if we need to apply it
+        if self.apply_scalar and self.scalar_column and self.scalar_column in self.schema:
+            select_cols.append(self.scalar_column)
 
         # Execute query
         df = (
@@ -345,19 +385,22 @@ class ParquetHeaderManager:
             self.open()
         assert self._lazy_frame is not None
 
-        # Select only needed columns
-        df = (
-            self._lazy_frame
-            .select([
-                self.columns.trace_index,
-                self.columns.source_x,
-                self.columns.source_y,
-                self.columns.receiver_x,
-                self.columns.receiver_y,
-            ])
-            .collect()
-        )
+        # Build list of columns to select
+        select_cols = [
+            self.columns.trace_index,
+            self.columns.source_x,
+            self.columns.source_y,
+            self.columns.receiver_x,
+            self.columns.receiver_y,
+        ]
 
+        # Include scalar column if we need to apply it
+        if self.apply_scalar and self.scalar_column and self.scalar_column in self.schema:
+            select_cols.append(self.scalar_column)
+
+        df = self._lazy_frame.select(select_cols).collect()
+
+        # Apply scalar if configured
         df = self._apply_scalar_if_needed(df)
 
         trace_indices = df[self.columns.trace_index].to_numpy().astype(np.int64)
@@ -367,6 +410,9 @@ class ParquetHeaderManager:
         receiver_y = df[self.columns.receiver_y].to_numpy().astype(np.float64)
 
         midpoint_x, midpoint_y = offset_to_midpoint(source_x, source_y, receiver_x, receiver_y)
+
+        logger.debug(f"get_all_midpoints: apply_scalar={self.apply_scalar}, "
+                    f"midpoint_x range: {midpoint_x.min():.1f} - {midpoint_x.max():.1f}")
 
         return trace_indices, midpoint_x, midpoint_y
 

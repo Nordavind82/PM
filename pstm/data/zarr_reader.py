@@ -57,7 +57,7 @@ class ZarrTraceReader:
     Reader for seismic trace data stored in Zarr format.
 
     Expected Zarr array structure:
-    - Shape: (n_traces, n_samples)
+    - Shape: (n_traces, n_samples) [standard] or (n_samples, n_traces) [transposed]
     - Dtype: float32 or float64
     - Attributes: sample_rate_ms, start_time_ms (optional)
 
@@ -74,6 +74,9 @@ class ZarrTraceReader:
         mode: str = "r",
         sample_rate_ms: float | None = None,
         start_time_ms: float | None = None,
+        transposed: bool = False,
+        n_traces: int | None = None,
+        n_samples: int | None = None,
     ):
         """
         Initialize the Zarr trace reader.
@@ -83,6 +86,9 @@ class ZarrTraceReader:
             mode: Open mode ('r' for read-only)
             sample_rate_ms: Override sample rate (auto-detected if None)
             start_time_ms: Override start time (auto-detected if None)
+            transposed: If True, data is stored as (n_samples, n_traces) instead of (n_traces, n_samples)
+            n_traces: Override number of traces (required if transposed)
+            n_samples: Override number of samples (required if transposed)
         """
         self.path = Path(path)
         self._mode = mode
@@ -92,6 +98,9 @@ class ZarrTraceReader:
         # Override values
         self._sample_rate_override = sample_rate_ms
         self._start_time_override = start_time_ms
+        self._transposed = transposed
+        self._n_traces_override = n_traces
+        self._n_samples_override = n_samples
 
         # Pre-allocated buffer for batch loading
         self._buffer: NDArray[np.float32] | None = None
@@ -166,9 +175,22 @@ class ZarrTraceReader:
             # Zarr v3 doesn't have .compressor attribute
             pass
 
+        # Determine shape - handle transposed data
+        zarr_shape = self._zarr.shape
+        if self._transposed:
+            # Data is stored as (n_samples, n_traces)
+            if self._n_traces_override is not None and self._n_samples_override is not None:
+                shape = (self._n_traces_override, self._n_samples_override)
+            else:
+                # Infer: first dim is samples, second is traces
+                shape = (zarr_shape[1], zarr_shape[0])
+            logger.debug(f"Transposed data: zarr shape {zarr_shape} -> logical shape {shape}")
+        else:
+            shape = zarr_shape
+
         return TraceDataInfo(
             path=self.path,
-            shape=self._zarr.shape,
+            shape=shape,
             dtype=self._zarr.dtype,
             chunks=self._zarr.chunks,
             compressor=compressor_name,
@@ -233,22 +255,39 @@ class ZarrTraceReader:
 
         # Handle different index types
         if isinstance(indices, slice):
-            data = self._zarr[indices]
+            if self._transposed:
+                # Data is (n_samples, n_traces) - need to select columns and transpose
+                data = self._zarr[:, indices].T
+            else:
+                data = self._zarr[indices]
         else:
             indices = np.asarray(indices, dtype=np.int64)
             if len(indices) == 0:
                 return np.empty((0, self.n_samples), dtype=np.float32)
 
-            # Zarr 3 requires different approach - use oindex for orthogonal indexing
-            # or load traces individually for robustness
-            try:
-                # Try orthogonal indexing (works in zarr 3)
-                data = self._zarr.oindex[indices, :]
-            except (AttributeError, TypeError):
-                # Fallback: load traces one by one (slower but robust)
-                data = np.empty((len(indices), self.n_samples), dtype=self._zarr.dtype)
-                for i, idx in enumerate(indices):
-                    data[i] = self._zarr[int(idx)]
+            if self._transposed:
+                # Data is stored as (n_samples, n_traces)
+                # We need to read columns (trace indices) and transpose result
+                try:
+                    # Try orthogonal indexing for columns
+                    data = self._zarr.oindex[:, indices].T  # (n_samples, n_selected) -> (n_selected, n_samples)
+                except (AttributeError, TypeError):
+                    # Fallback: load traces one by one
+                    data = np.empty((len(indices), self.n_samples), dtype=self._zarr.dtype)
+                    for i, idx in enumerate(indices):
+                        data[i] = self._zarr[:, int(idx)]
+            else:
+                # Standard format: (n_traces, n_samples)
+                # Zarr 3 requires different approach - use oindex for orthogonal indexing
+                # or load traces individually for robustness
+                try:
+                    # Try orthogonal indexing (works in zarr 3)
+                    data = self._zarr.oindex[indices, :]
+                except (AttributeError, TypeError):
+                    # Fallback: load traces one by one (slower but robust)
+                    data = np.empty((len(indices), self.n_samples), dtype=self._zarr.dtype)
+                    for i, idx in enumerate(indices):
+                        data[i] = self._zarr[int(idx)]
 
         # Convert to float32 if needed
         if data.dtype != np.float32:
@@ -275,7 +314,12 @@ class ZarrTraceReader:
             self.open()
         assert self._zarr is not None
 
-        data = self._zarr[index]
+        if self._transposed:
+            # Data is (n_samples, n_traces) - read column
+            data = self._zarr[:, index]
+        else:
+            data = self._zarr[index]
+
         if data.dtype != np.float32:
             data = data.astype(np.float32)
         return data

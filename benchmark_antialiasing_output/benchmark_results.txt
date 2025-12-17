@@ -1,0 +1,15 @@
+PSTM ANTI-ALIASING BENCHMARK
+=======================================================
+
+Input Data:
+  Traces: 13,448
+  Diffractor: (1000.0, 1000.0, 500.0)
+  Velocity: 2500.0 m/s
+
+Timing Results:
+Configuration                  Time (s)     Relative  
+-------------------------------------------------------
+no_antialiasing                3.00         1.00      x
+triangle_aa                    2.69         0.90      x
+triangle_aa_spreading          3.63         1.21      x
+triangle_aa_both_amp           4.16         1.39      x

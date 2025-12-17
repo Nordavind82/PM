@@ -1,0 +1,15 @@
+MLX PSTM AMPLITUDE CORRECTION BENCHMARK
+==================================================
+
+Input Data:
+  Traces: 13,448
+  Diffractor: (1000.0, 1000.0, 500.0)
+  Velocity: 2500.0 m/s
+
+Timing Results:
+Configuration             Time (s)     Relative  
+--------------------------------------------------
+no_corrections            4.98         1.00      x
+spreading_only            5.28         1.06      x
+obliquity_only            5.18         1.04      x
+both_corrections          6.23         1.25      x

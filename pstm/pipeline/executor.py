@@ -29,6 +29,7 @@ except ImportError:
     HAS_PSUTIL = False
 
 from pstm.config.models import MigrationConfig
+from pstm.data.parquet_headers import TraceGeometry
 
 
 def get_cpu_info() -> dict:
@@ -493,6 +494,9 @@ class MigrationExecutor:
             self.config.input.traces_path,
             sample_rate_ms=self.config.input.sample_rate_ms,
             start_time_ms=self.config.input.start_time_ms,
+            transposed=self.config.input.transposed,
+            n_traces=self.config.input.num_traces,
+            n_samples=self.config.input.num_samples,
         )
         self._trace_reader.open()
         self._debug.info(f"Trace reader opened: {self._trace_reader.n_traces} traces, {self._trace_reader.n_samples} samples")
@@ -517,6 +521,37 @@ class MigrationExecutor:
         else:
             self._debug.debug("Building new spatial index from midpoints...")
             trace_indices, midpoint_x, midpoint_y = self._header_manager.get_all_midpoints()
+
+            # Apply data selection filter to reduce traces BEFORE building spatial index
+            data_sel = self.config.data_selection
+            if data_sel.mode.value != "all":
+                self._debug.info(f"Applying data selection filter: {data_sel.mode.value}")
+                logger.info(f"Applying data selection filter: {data_sel.mode.value}")
+
+                # Load offset values for filtering
+                offset_col = self.config.input.columns.offset or "OFFSET"
+                if offset_col in self._header_manager.schema:
+                    offset_values = self._header_manager.get_column(offset_col)
+
+                    # Build headers dict for data selection
+                    headers = {'offset': offset_values}
+
+                    # Apply data selection filter
+                    mask = data_sel.apply(headers)
+                    n_before = len(trace_indices)
+                    n_after = mask.sum()
+
+                    # Filter arrays
+                    trace_indices = trace_indices[mask]
+                    midpoint_x = midpoint_x[mask]
+                    midpoint_y = midpoint_y[mask]
+
+                    self._debug.info(f"Data selection: {n_before:,} -> {n_after:,} traces ({100*n_after/n_before:.1f}%)")
+                    logger.info(f"Data selection: {n_before:,} -> {n_after:,} traces ({100*n_after/n_before:.1f}%)")
+                else:
+                    self._debug.warning(f"Offset column '{offset_col}' not found, skipping data selection filter")
+                    logger.warning(f"Offset column '{offset_col}' not found, skipping data selection filter")
+
             self._spatial_index = SpatialIndex.build(trace_indices, midpoint_x, midpoint_y)
         self._debug.info(f"Spatial index ready: {self._spatial_index.n_points} entries")
         log_memory_state(self._debug, "after_spatial_index")
@@ -564,47 +599,100 @@ class MigrationExecutor:
         work_dir = self.config.output.output_dir / ".work"
         self._memmap_manager = MemmapManager(work_dir)
 
-        # Create output accumulator
+        # Create output accumulator(s)
         grid = self.config.output.grid
-        self._memmap_manager.create(
-            "image",
-            shape=(grid.nx, grid.ny, grid.nt),
-            dtype=np.float64,
-            fill_value=0.0,
-        )
-        self._memmap_manager.create(
-            "fold",
-            shape=(grid.nx, grid.ny),
-            dtype=np.int32,
-            fill_value=0,
-        )
+        products = self.config.output.products
 
-        # Create header accumulators for CIG support
-        # These accumulate offset/azimuth per bin for later sorting
-        self._memmap_manager.create(
-            "trace_count",  # Count of traces per bin (independent of kernel fold)
-            shape=(grid.nx, grid.ny),
-            dtype=np.int32,
-            fill_value=0,
-        )
-        self._memmap_manager.create(
-            "offset_sum",
-            shape=(grid.nx, grid.ny),
-            dtype=np.float64,
-            fill_value=0.0,
-        )
-        self._memmap_manager.create(
-            "azimuth_sin_sum",  # For circular mean: sum of sin(azimuth)
-            shape=(grid.nx, grid.ny),
-            dtype=np.float64,
-            fill_value=0.0,
-        )
-        self._memmap_manager.create(
-            "azimuth_cos_sum",  # For circular mean: sum of cos(azimuth)
-            shape=(grid.nx, grid.ny),
-            dtype=np.float64,
-            fill_value=0.0,
-        )
+        # Determine offset bins for gather output
+        self._offset_bins = []  # List of (min, max, bin_id) tuples
+        if products.output_gathers and products.gather_offset_ranges:
+            for i, (omin, omax) in enumerate(products.gather_offset_ranges):
+                self._offset_bins.append((omin, omax, i))
+            logger.info(f"Output gathers mode: {len(self._offset_bins)} offset bins")
+            for omin, omax, bid in self._offset_bins:
+                logger.info(f"  Bin {bid}: offset {omin:.0f} - {omax:.0f} m")
+
+        n_bins = max(1, len(self._offset_bins))  # At least 1 for full stack
+
+        # Create accumulators - if gathers mode, create per-bin arrays
+        if self._offset_bins:
+            # Create separate image/fold per offset bin
+            for bid in range(n_bins):
+                self._memmap_manager.create(
+                    f"image_bin_{bid}",
+                    shape=(grid.nx, grid.ny, grid.nt),
+                    dtype=np.float64,
+                    fill_value=0.0,
+                )
+                self._memmap_manager.create(
+                    f"fold_bin_{bid}",
+                    shape=(grid.nx, grid.ny),
+                    dtype=np.int32,
+                    fill_value=0,
+                )
+                self._memmap_manager.create(
+                    f"trace_count_bin_{bid}",
+                    shape=(grid.nx, grid.ny),
+                    dtype=np.int32,
+                    fill_value=0,
+                )
+                self._memmap_manager.create(
+                    f"offset_sum_bin_{bid}",
+                    shape=(grid.nx, grid.ny),
+                    dtype=np.float64,
+                    fill_value=0.0,
+                )
+                self._memmap_manager.create(
+                    f"azimuth_sin_sum_bin_{bid}",
+                    shape=(grid.nx, grid.ny),
+                    dtype=np.float64,
+                    fill_value=0.0,
+                )
+                self._memmap_manager.create(
+                    f"azimuth_cos_sum_bin_{bid}",
+                    shape=(grid.nx, grid.ny),
+                    dtype=np.float64,
+                    fill_value=0.0,
+                )
+        else:
+            # Single full-stack output (original behavior)
+            self._memmap_manager.create(
+                "image",
+                shape=(grid.nx, grid.ny, grid.nt),
+                dtype=np.float64,
+                fill_value=0.0,
+            )
+            self._memmap_manager.create(
+                "fold",
+                shape=(grid.nx, grid.ny),
+                dtype=np.int32,
+                fill_value=0,
+            )
+            # Create header accumulators for CIG support
+            self._memmap_manager.create(
+                "trace_count",
+                shape=(grid.nx, grid.ny),
+                dtype=np.int32,
+                fill_value=0,
+            )
+            self._memmap_manager.create(
+                "offset_sum",
+                shape=(grid.nx, grid.ny),
+                dtype=np.float64,
+                fill_value=0.0,
+            )
+            self._memmap_manager.create(
+                "azimuth_sin_sum",
+                shape=(grid.nx, grid.ny),
+                dtype=np.float64,
+                fill_value=0.0,
+            )
+            self._memmap_manager.create(
+                "azimuth_cos_sum",
+                shape=(grid.nx, grid.ny),
+                dtype=np.float64,
+                fill_value=0.0,
+            )
 
         print_success("Initialization complete")
 
@@ -662,13 +750,45 @@ class MigrationExecutor:
         assert self._kernel is not None
         assert self._memmap_manager is not None
 
-        # Get arrays
-        image = self._memmap_manager.get("image")
-        fold = self._memmap_manager.get("fold")
-        trace_count = self._memmap_manager.get("trace_count")
-        offset_sum = self._memmap_manager.get("offset_sum")
-        azimuth_sin_sum = self._memmap_manager.get("azimuth_sin_sum")
-        azimuth_cos_sum = self._memmap_manager.get("azimuth_cos_sum")
+        # Check if we're in gathers mode (multiple offset bins)
+        if self._offset_bins:
+            # Run migration for each offset bin separately
+            for omin, omax, bid in self._offset_bins:
+                logger.info(f"=== Processing offset bin {bid}: {omin:.0f} - {omax:.0f} m ===")
+                self._migrate_single_bin(bid, omin, omax)
+        else:
+            # Single full-stack migration (original behavior)
+            self._migrate_single_bin(None, None, None)
+
+    def _migrate_single_bin(
+        self,
+        bin_id: int | None,
+        offset_min: float | None,
+        offset_max: float | None,
+    ) -> None:
+        """Execute migration for a single offset bin (or full stack if bin_id is None)."""
+        # In gathers mode, reset checkpoint for each bin
+        # (checkpoint tracks tiles per bin, but we process bins sequentially)
+        if bin_id is not None and self._checkpoint:
+            self._checkpoint.state.completed_tiles.clear()
+            self._debug.info(f"[BIN {bin_id}] Reset checkpoint for new offset bin")
+
+        # Get arrays - use bin-specific names if in gathers mode
+        if bin_id is not None:
+            image = self._memmap_manager.get(f"image_bin_{bin_id}")
+            fold = self._memmap_manager.get(f"fold_bin_{bin_id}")
+            trace_count = self._memmap_manager.get(f"trace_count_bin_{bin_id}")
+            offset_sum = self._memmap_manager.get(f"offset_sum_bin_{bin_id}")
+            azimuth_sin_sum = self._memmap_manager.get(f"azimuth_sin_sum_bin_{bin_id}")
+            azimuth_cos_sum = self._memmap_manager.get(f"azimuth_cos_sum_bin_{bin_id}")
+        else:
+            image = self._memmap_manager.get("image")
+            fold = self._memmap_manager.get("fold")
+            trace_count = self._memmap_manager.get("trace_count")
+            offset_sum = self._memmap_manager.get("offset_sum")
+            azimuth_sin_sum = self._memmap_manager.get("azimuth_sin_sum")
+            azimuth_cos_sum = self._memmap_manager.get("azimuth_cos_sum")
+
         self._debug.debug(f"Output image shape: {image.shape}, dtype: {image.dtype}")
         self._debug.debug(f"Output fold shape: {fold.shape}, dtype: {fold.dtype}")
 
@@ -720,7 +840,8 @@ class MigrationExecutor:
 
             # Process single tile (reports progress with trace count)
             metrics, tile_trace_count, tile_data_mb, tile_trace_indices = self._process_tile(
-                tile, image, fold, trace_count, offset_sum, azimuth_sin_sum, azimuth_cos_sum, kernel_config, grid
+                tile, image, fold, trace_count, offset_sum, azimuth_sin_sum, azimuth_cos_sum,
+                kernel_config, grid, offset_min, offset_max,
             )
 
             # Track aperture efficiency
@@ -831,9 +952,15 @@ class MigrationExecutor:
         azimuth_cos_sum: NDArray,
         kernel_config: KernelConfig,
         grid,
+        offset_min: float | None = None,
+        offset_max: float | None = None,
     ) -> tuple[KernelMetrics, int, float, list[int]]:
         """
         Process a single tile.
+
+        Args:
+            offset_min: If provided, only include traces with offset >= offset_min
+            offset_max: If provided, only include traces with offset <= offset_max
 
         Returns:
             Tuple of (metrics, tile_trace_count, tile_data_mb, tile_trace_indices):
@@ -903,6 +1030,39 @@ class MigrationExecutor:
         geometry = self._header_manager.get_geometry_for_indices(query_result.trace_indices)
         t_geom_load = time.time() - t0
         self._debug.info(f"  [TIMING] Geometry load: {t_geom_load:.3f}s")
+
+        # Filter by offset if specified (for offset-binned gather output)
+        if offset_min is not None or offset_max is not None:
+            offset_mask = np.ones(len(geometry.offset), dtype=bool)
+            if offset_min is not None:
+                offset_mask &= (geometry.offset >= offset_min)
+            if offset_max is not None:
+                offset_mask &= (geometry.offset <= offset_max)
+
+            n_before = len(geometry.offset)
+            n_after = np.sum(offset_mask)
+            self._debug.info(f"  [OFFSET FILTER] {offset_min:.0f}-{offset_max:.0f}m: {n_before} -> {n_after} traces")
+
+            if n_after == 0:
+                # No traces in this offset range for this tile
+                return (
+                    KernelMetrics(n_traces_processed=0, n_samples_output=0, compute_time_s=0.0),
+                    0, 0.0, [],
+                )
+
+            # Apply mask to trace data and geometry
+            trace_data = trace_data[offset_mask]
+            geometry = TraceGeometry(
+                trace_indices=geometry.trace_indices[offset_mask],
+                source_x=geometry.source_x[offset_mask],
+                source_y=geometry.source_y[offset_mask],
+                receiver_x=geometry.receiver_x[offset_mask],
+                receiver_y=geometry.receiver_y[offset_mask],
+                offset=geometry.offset[offset_mask],
+                midpoint_x=geometry.midpoint_x[offset_mask],
+                midpoint_y=geometry.midpoint_y[offset_mask],
+            )
+            trace_data_mb = trace_data.nbytes / 1024**2
 
         # Create trace block
         traces = create_trace_block(
@@ -1054,6 +1214,16 @@ class MigrationExecutor:
         """Finalize migration output."""
         assert self._memmap_manager is not None
 
+        grid = self.config.output.grid
+
+        # Check if we're in gathers mode (multiple offset bins)
+        if self._offset_bins:
+            self._finalize_gathers()
+        else:
+            self._finalize_stack()
+
+    def _finalize_stack(self) -> None:
+        """Finalize single stacked output (original behavior)."""
         logger.info("Normalizing output...")
 
         image = self._memmap_manager.get("image")
@@ -1109,7 +1279,6 @@ class MigrationExecutor:
             z_fold.attrs["description"] = "Migration fold map"
 
         # Compute and write average header values (offset, azimuth) per bin
-        # These enable resort to CIG (common offset, common angle, etc.)
         logger.info("Computing average headers per bin...")
         trace_count = self._memmap_manager.get("trace_count")
         offset_sum = self._memmap_manager.get("offset_sum")
@@ -1118,26 +1287,161 @@ class MigrationExecutor:
 
         # Use trace_count for averaging (independent of kernel fold tracking)
         with np.errstate(invalid="ignore", divide="ignore"):
-            # Average offset per bin
             offset_avg = np.where(trace_count > 0, offset_sum / trace_count, 0.0)
-
-            # Circular mean for azimuth: atan2(sum_sin, sum_cos)
             azimuth_avg = np.degrees(np.arctan2(azimuth_sin_sum, azimuth_cos_sum)) % 360
-            # Set to 0 where no data
             azimuth_avg = np.where(trace_count > 0, azimuth_avg, 0.0)
 
-        # Write headers to Parquet (tabular format for CIG resort)
+        # Write headers to Parquet
+        self._write_bin_headers(trace_count, offset_avg, azimuth_avg, grid)
+
+        # Clean up checkpoint
+        if self._checkpoint:
+            self._checkpoint.cleanup()
+
+        print_success(f"Output written to {output_path}")
+
+    def _finalize_gathers(self) -> None:
+        """Finalize offset-binned gather output (multiple volumes)."""
+        logger.info(f"Finalizing {len(self._offset_bins)} offset-binned gather volumes...")
+
+        grid = self.config.output.grid
+        gathers_dir = self.config.output.output_dir / "gathers"
+        gathers_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect all bin headers for combined output
+        all_headers = []
+
+        for omin, omax, bid in self._offset_bins:
+            logger.info(f"Writing gather bin {bid}: offset {omin:.0f} - {omax:.0f} m")
+
+            image = self._memmap_manager.get(f"image_bin_{bid}")
+            fold = self._memmap_manager.get(f"fold_bin_{bid}")
+            trace_count = self._memmap_manager.get(f"trace_count_bin_{bid}")
+            offset_sum = self._memmap_manager.get(f"offset_sum_bin_{bid}")
+            azimuth_sin_sum = self._memmap_manager.get(f"azimuth_sin_sum_bin_{bid}")
+            azimuth_cos_sum = self._memmap_manager.get(f"azimuth_cos_sum_bin_{bid}")
+
+            # Normalize by fold
+            fold_3d = fold[:, :, np.newaxis]
+            if np.any(fold > 0):
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    image_normalized = np.where(fold_3d > 0, image / fold_3d, 0.0)
+            else:
+                image_normalized = image
+
+            # Write volume for this bin
+            offset_center = (omin + omax) / 2
+            output_path = gathers_dir / f"offset_bin_{bid:03d}.zarr"
+
+            z = zarr.open(
+                str(output_path),
+                mode="w",
+                shape=image_normalized.shape,
+                chunks=(
+                    self.config.output.chunk_x,
+                    self.config.output.chunk_y,
+                    self.config.output.chunk_t or grid.nt,
+                ),
+                dtype=np.float32,
+            )
+            z[:] = image_normalized.astype(np.float32)
+
+            # Add metadata including offset bin info
+            z.attrs["x_min"] = grid.x_min
+            z.attrs["x_max"] = grid.x_max
+            z.attrs["dx"] = grid.dx
+            z.attrs["y_min"] = grid.y_min
+            z.attrs["y_max"] = grid.y_max
+            z.attrs["dy"] = grid.dy
+            z.attrs["t_min_ms"] = grid.t_min_ms
+            z.attrs["t_max_ms"] = grid.t_max_ms
+            z.attrs["dt_ms"] = grid.dt_ms
+            z.attrs["migration_type"] = "PSTM"
+            z.attrs["offset_bin_id"] = bid
+            z.attrs["offset_min"] = omin
+            z.attrs["offset_max"] = omax
+            z.attrs["offset_center"] = offset_center
+
+            # Write fold for this bin
+            fold_path = gathers_dir / f"fold_bin_{bid:03d}.zarr"
+            z_fold = zarr.open(str(fold_path), mode="w", shape=fold.shape, dtype=np.int32)
+            z_fold[:] = fold
+            z_fold.attrs["offset_bin_id"] = bid
+
+            # Compute averages for this bin
+            with np.errstate(invalid="ignore", divide="ignore"):
+                offset_avg = np.where(trace_count > 0, offset_sum / trace_count, 0.0)
+                azimuth_avg = np.degrees(np.arctan2(azimuth_sin_sum, azimuth_cos_sum)) % 360
+                azimuth_avg = np.where(trace_count > 0, azimuth_avg, 0.0)
+
+            # Build headers for this bin
+            x_coords = np.linspace(grid.x_min, grid.x_max, grid.nx)
+            y_coords = np.linspace(grid.y_min, grid.y_max, grid.ny)
+            xx, yy = np.meshgrid(np.arange(grid.nx), np.arange(grid.ny), indexing="ij")
+            x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing="ij")
+
+            df_bin = pl.DataFrame({
+                "ix": xx.ravel().astype(np.int32),
+                "iy": yy.ravel().astype(np.int32),
+                "x": x_grid.ravel().astype(np.float64),
+                "y": y_grid.ravel().astype(np.float64),
+                "trace_count": trace_count.ravel().astype(np.int32),
+                "offset_avg": offset_avg.ravel().astype(np.float32),
+                "azimuth_avg": azimuth_avg.ravel().astype(np.float32),
+                "offset_bin_id": np.full(grid.nx * grid.ny, bid, dtype=np.int32),
+                "offset_bin_min": np.full(grid.nx * grid.ny, omin, dtype=np.float32),
+                "offset_bin_max": np.full(grid.nx * grid.ny, omax, dtype=np.float32),
+                "offset_bin_center": np.full(grid.nx * grid.ny, offset_center, dtype=np.float32),
+            })
+
+            # Filter to bins with data
+            df_bin = df_bin.filter(pl.col("trace_count") > 0)
+            all_headers.append(df_bin)
+
+            n_bins_with_data = len(df_bin)
+            logger.info(f"  Bin {bid}: {n_bins_with_data} spatial bins with data")
+
+        # Combine all headers and write
+        if all_headers:
+            df_all = pl.concat(all_headers)
+            headers_path = self.config.output.output_dir / "gather_headers.parquet"
+            df_all.write_parquet(str(headers_path))
+            logger.info(f"Gather headers written to {headers_path}: {len(df_all)} total entries")
+
+        # Write gather index file
+        index_path = self.config.output.output_dir / "gathers_index.parquet"
+        index_df = pl.DataFrame({
+            "bin_id": [bid for _, _, bid in self._offset_bins],
+            "offset_min": [omin for omin, _, _ in self._offset_bins],
+            "offset_max": [omax for _, omax, _ in self._offset_bins],
+            "offset_center": [(omin + omax) / 2 for omin, omax, _ in self._offset_bins],
+            "volume_path": [f"gathers/offset_bin_{bid:03d}.zarr" for _, _, bid in self._offset_bins],
+        })
+        index_df.write_parquet(str(index_path))
+        logger.info(f"Gather index written to {index_path}")
+
+        # Clean up checkpoint
+        if self._checkpoint:
+            self._checkpoint.cleanup()
+
+        print_success(f"Gathers output written to {gathers_dir}")
+
+    def _write_bin_headers(
+        self,
+        trace_count: NDArray,
+        offset_avg: NDArray,
+        azimuth_avg: NDArray,
+        grid,
+    ) -> None:
+        """Write bin headers to Parquet."""
         headers_path = self.config.output.output_dir / "bin_headers.parquet"
 
-        # Build grid coordinate arrays
         x_coords = np.linspace(grid.x_min, grid.x_max, grid.nx)
         y_coords = np.linspace(grid.y_min, grid.y_max, grid.ny)
 
-        # Create meshgrid for bin coordinates
         xx, yy = np.meshgrid(np.arange(grid.nx), np.arange(grid.ny), indexing="ij")
         x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing="ij")
 
-        # Flatten 2D arrays to 1D for Parquet table
         df = pl.DataFrame({
             "ix": xx.ravel().astype(np.int32),
             "iy": yy.ravel().astype(np.int32),
@@ -1148,22 +1452,13 @@ class MigrationExecutor:
             "azimuth_avg": azimuth_avg.ravel().astype(np.float32),
         })
 
-        # Filter to only bins with data (optional, keeps file smaller)
         df_with_data = df.filter(pl.col("trace_count") > 0)
-
-        # Write to Parquet
         df_with_data.write_parquet(str(headers_path))
 
         logger.info(
             f"Headers written to {headers_path}: "
             f"{len(df_with_data)} bins with data out of {grid.nx * grid.ny} total"
         )
-
-        # Clean up checkpoint
-        if self._checkpoint:
-            self._checkpoint.cleanup()
-
-        print_success(f"Output written to {output_path}")
 
     def _save_checkpoint(self) -> None:
         """Save checkpoint."""

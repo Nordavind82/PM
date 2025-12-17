@@ -604,5 +604,9 @@ class VelocityStep(WizardStepWidget):
         if self._validation_errors:
             self.show_validation_errors()
             return False
-        
+
         return True
+
+    def refresh_from_state(self) -> None:
+        """Refresh UI from loaded state."""
+        self.load_from_model()

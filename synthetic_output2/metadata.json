@@ -1,0 +1,40 @@
+{
+  "n_traces": 103684,
+  "n_samples": 1501,
+  "sample_rate_ms": 2.0,
+  "dt_ms": 2.0,
+  "t_start_ms": 0.0,
+  "velocity_ms": 2500.0,
+  "format": "pstm_zarr_parquet",
+  "synthetic": true,
+  "diffractors": [
+    {
+      "x": 2000.0,
+      "y": 2000.0,
+      "z": 800.0,
+      "amplitude": 1.0
+    }
+  ],
+  "offset_azimuth_planes": [
+    {
+      "offset": 200,
+      "azimuth_deg": 0,
+      "name": "off200_az0"
+    },
+    {
+      "offset": 200,
+      "azimuth_deg": 360,
+      "name": "off200_az360"
+    },
+    {
+      "offset": 400,
+      "azimuth_deg": 0,
+      "name": "off400_az0"
+    },
+    {
+      "offset": 400,
+      "azimuth_deg": 360,
+      "name": "off400_az360"
+    }
+  ]
+}

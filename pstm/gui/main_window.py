@@ -14,10 +14,14 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QFrame, QFileDialog, QMessageBox,
     QProgressBar,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 
 from pstm.gui.state import WizardState, WizardController, StepStatus
+
+# Default config location
+DEFAULT_CONFIG_DIR = Path.home() / ".pstm"
+LAST_SESSION_FILE = DEFAULT_CONFIG_DIR / "last_session.json"
 
 if TYPE_CHECKING:
     from pstm.gui.steps.base import WizardStepWidget
@@ -294,24 +298,33 @@ class HeaderBar(QFrame):
 
 class PSTMWizardWindow(QMainWindow):
     """Main wizard window."""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PSTM Migration Wizard")
         self.setMinimumSize(1200, 800)
-        
+
         self.controller = WizardController()
         self.controller.add_change_callback(self._on_state_change)
-        
+
         self.step_widgets: list[WizardStepWidget] = []
         self._last_save_path = None
-        
+        self._auto_save_pending = False
+
+        # Auto-save timer (debounced - saves 2 seconds after last change)
+        self._auto_save_timer = QTimer()
+        self._auto_save_timer.setSingleShot(True)
+        self._auto_save_timer.timeout.connect(self._do_auto_save)
+
         self._setup_ui()
         self._setup_menu()
         self._setup_shortcuts()
         self._create_steps()
-        
-        self._go_to_step(0)
+
+        # Try to load last session
+        self._load_last_session()
+
+        self._go_to_step(self.controller.state.current_step)
     
     def _setup_ui(self):
         central = QWidget()
@@ -491,6 +504,46 @@ class PSTMWizardWindow(QMainWindow):
                 completed += 1
 
         self.sidebar.update_progress(completed)
+
+        # Schedule auto-save (debounced)
+        self._auto_save_pending = True
+        self._auto_save_timer.start(2000)  # Save 2 seconds after last change
+
+    def _load_last_session(self) -> None:
+        """Try to load the last session state on startup."""
+        if LAST_SESSION_FILE.exists():
+            try:
+                self.controller.state = WizardState.load(LAST_SESSION_FILE)
+                self.controller.notify_change()
+
+                # Refresh all step widgets with loaded state
+                self._refresh_all_steps()
+
+                self.header.set_status("Restored last session")
+            except Exception as e:
+                print(f"Could not restore last session: {e}")
+                # Start fresh if load fails
+
+    def _refresh_all_steps(self) -> None:
+        """Refresh all step widgets to reflect current state."""
+        for step in self.step_widgets:
+            if hasattr(step, 'refresh_from_state'):
+                try:
+                    step.refresh_from_state()
+                except Exception as e:
+                    print(f"Error refreshing {step.title}: {e}")
+
+    def _do_auto_save(self) -> None:
+        """Perform auto-save to last session file."""
+        if not self._auto_save_pending:
+            return
+
+        try:
+            DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self.controller.state.save(LAST_SESSION_FILE)
+            self._auto_save_pending = False
+        except Exception as e:
+            print(f"Auto-save failed: {e}")
     
     def _new_project(self) -> None:
         reply = QMessageBox.question(self, "New Project",
@@ -511,6 +564,10 @@ class PSTMWizardWindow(QMainWindow):
         try:
             self.controller.state = WizardState.load(path)
             self.controller.notify_change()
+
+            # Refresh all step widgets with loaded state
+            self._refresh_all_steps()
+
             self._go_to_step(self.controller.state.current_step)
             self.header.set_status(f"Loaded: {Path(path).name}")
         except Exception as e:
@@ -564,5 +621,12 @@ class PSTMWizardWindow(QMainWindow):
 
                     # Stop migration gracefully
                     execution_step.cleanup()
+
+        # Force save session state before closing
+        try:
+            DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self.controller.state.save(LAST_SESSION_FILE)
+        except Exception as e:
+            print(f"Failed to save session on close: {e}")
 
         event.accept()
