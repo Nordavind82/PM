@@ -351,20 +351,117 @@ class CubeVelocityModel(VelocityModel):
         x_axis: NDArray[np.float64],
         y_axis: NDArray[np.float64],
         t_axis_ms: NDArray[np.float64],
+        chunk_size: int = 50,
+        x_grid: NDArray[np.float64] | None = None,
+        y_grid: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
+        """
+        Get Vrms volume interpolated to output grid.
+
+        Uses chunk-based processing to avoid massive memory allocations.
+        For a 511x427x1001 grid, naive meshgrid would allocate ~17 GB of
+        temporary arrays. Chunking reduces peak memory to ~1-2 GB.
+
+        Args:
+            x_axis: Output X coordinates (1D, used for axis-aligned grids)
+            y_axis: Output Y coordinates (1D, used for axis-aligned grids)
+            t_axis_ms: Output time axis in milliseconds
+            chunk_size: Number of X/Y points to process at once (default 50)
+            x_grid: Optional 2D X coordinate grid for rotated grids (nx, ny)
+            y_grid: Optional 2D Y coordinate grid for rotated grids (nx, ny)
+
+        Returns:
+            Vrms volume of shape (nx, ny, nt)
+
+        Note:
+            For rotated grids, x_grid and y_grid MUST be provided to get
+            correct velocity sampling. Using only x_axis/y_axis with meshgrid
+            would sample velocity from wrong locations!
+        """
         self._ensure_interpolator()
         assert self._interpolator is not None
 
-        nx, ny, nt = len(x_axis), len(y_axis), len(t_axis_ms)
+        # Use 2D grids if provided (for rotated grids)
+        use_2d_grids = x_grid is not None and y_grid is not None
 
-        # Create meshgrid of output coordinates
-        xx, yy, tt = np.meshgrid(x_axis, y_axis, t_axis_ms, indexing="ij")
-        points = np.column_stack([xx.ravel(), yy.ravel(), tt.ravel()])
+        if use_2d_grids:
+            nx, ny = x_grid.shape
+            nt = len(t_axis_ms)
+            logger.info(f"Using 2D coordinate grids for velocity interpolation (rotated grid support)")
+        else:
+            nx, ny, nt = len(x_axis), len(y_axis), len(t_axis_ms)
 
-        # Interpolate
-        vrms_flat = self._interpolator(points)
+        # Estimate memory for full approach
+        full_meshgrid_gb = (nx * ny * nt * 8 * 4) / (1024**3)  # 4 arrays
 
-        return vrms_flat.reshape((nx, ny, nt))
+        if full_meshgrid_gb < 1.0:
+            # Small enough to do in one shot
+            if use_2d_grids:
+                # For 2D grids, broadcast X and Y with time
+                # X_grid and Y_grid are (nx, ny), we need (nx, ny, nt)
+                xx = np.broadcast_to(x_grid[:, :, np.newaxis], (nx, ny, nt))
+                yy = np.broadcast_to(y_grid[:, :, np.newaxis], (nx, ny, nt))
+                tt = np.broadcast_to(t_axis_ms[np.newaxis, np.newaxis, :], (nx, ny, nt))
+                points = np.column_stack([xx.ravel(), yy.ravel(), tt.ravel()])
+            else:
+                xx, yy, tt = np.meshgrid(x_axis, y_axis, t_axis_ms, indexing="ij")
+                points = np.column_stack([xx.ravel(), yy.ravel(), tt.ravel()])
+            vrms_flat = self._interpolator(points)
+            return vrms_flat.reshape((nx, ny, nt))
+
+        # Use chunked processing for large grids
+        logger.info(
+            f"Using chunked velocity interpolation: {nx}x{ny}x{nt} grid, "
+            f"chunk_size={chunk_size} (avoids {full_meshgrid_gb:.1f} GB peak allocation)"
+        )
+
+        # Pre-allocate output array
+        result = np.empty((nx, ny, nt), dtype=np.float64)
+
+        # Process in chunks to limit peak memory
+        total_chunks = ((nx + chunk_size - 1) // chunk_size) * ((ny + chunk_size - 1) // chunk_size)
+        chunk_count = 0
+
+        for i_start in range(0, nx, chunk_size):
+            i_end = min(i_start + chunk_size, nx)
+
+            for j_start in range(0, ny, chunk_size):
+                j_end = min(j_start + chunk_size, ny)
+
+                chunk_nx = i_end - i_start
+                chunk_ny = j_end - j_start
+
+                if use_2d_grids:
+                    # Extract chunk from 2D grids
+                    chunk_x_grid = x_grid[i_start:i_end, j_start:j_end]
+                    chunk_y_grid = y_grid[i_start:i_end, j_start:j_end]
+
+                    # Broadcast with time axis
+                    xx = np.broadcast_to(chunk_x_grid[:, :, np.newaxis], (chunk_nx, chunk_ny, nt))
+                    yy = np.broadcast_to(chunk_y_grid[:, :, np.newaxis], (chunk_nx, chunk_ny, nt))
+                    tt = np.broadcast_to(t_axis_ms[np.newaxis, np.newaxis, :], (chunk_nx, chunk_ny, nt))
+                else:
+                    # Use 1D axes with meshgrid (axis-aligned grids)
+                    chunk_x = x_axis[i_start:i_end]
+                    chunk_y = y_axis[j_start:j_end]
+                    xx, yy, tt = np.meshgrid(chunk_x, chunk_y, t_axis_ms, indexing="ij")
+
+                points = np.column_stack([xx.ravel(), yy.ravel(), tt.ravel()])
+
+                # Interpolate chunk
+                vrms_chunk = self._interpolator(points).reshape((chunk_nx, chunk_ny, nt))
+
+                # Store in result
+                result[i_start:i_end, j_start:j_end, :] = vrms_chunk
+
+                # Explicit cleanup of temporary arrays
+                del xx, yy, tt, points, vrms_chunk
+
+                chunk_count += 1
+
+        logger.debug(f"Velocity interpolation complete: processed {chunk_count} chunks")
+
+        return result
 
     @property
     def is_laterally_constant(self) -> bool:
@@ -466,13 +563,14 @@ def validate_velocity_range(
 class VelocityManager:
     """
     Manages velocity model for migration, including tile extraction.
-    
+
     Handles:
     - Pre-interpolation to output grid
     - Tile-based velocity extraction
     - Memory-efficient velocity access
+    - Proper handling of rotated grids via 2D coordinate grids
     """
-    
+
     def __init__(
         self,
         model: VelocityModel,
@@ -480,38 +578,56 @@ class VelocityManager:
         output_y_axis: NDArray[np.float64],
         output_t_axis_ms: NDArray[np.float64],
         precompute: bool = True,
+        output_x_grid: NDArray[np.float64] | None = None,
+        output_y_grid: NDArray[np.float64] | None = None,
     ):
         """
         Initialize velocity manager.
-        
+
         Args:
             model: Velocity model
-            output_x_axis: Output X coordinates
-            output_y_axis: Output Y coordinates
+            output_x_axis: Output X coordinates (1D)
+            output_y_axis: Output Y coordinates (1D)
             output_t_axis_ms: Output time axis (ms)
             precompute: Pre-interpolate to output grid
+            output_x_grid: 2D X coordinate grid (nx, ny) for rotated grids
+            output_y_grid: 2D Y coordinate grid (nx, ny) for rotated grids
+
+        Note:
+            For rotated grids, output_x_grid and output_y_grid MUST be provided
+            to ensure velocity is sampled at the correct spatial locations.
+            Without these, velocity would be sampled from wrong locations,
+            causing residual moveout in CIGs.
         """
         self.model = model
         self.output_x_axis = output_x_axis
         self.output_y_axis = output_y_axis
         self.output_t_axis_ms = output_t_axis_ms
-        
+        self.output_x_grid = output_x_grid
+        self.output_y_grid = output_y_grid
+
         self._precomputed: NDArray[np.float64] | None = None
         self._is_1d = model.is_laterally_constant
-        
+        self._is_rotated = output_x_grid is not None and output_y_grid is not None
+
+        if self._is_rotated:
+            logger.info("VelocityManager: Using 2D coordinate grids for rotated grid support")
+
         if precompute and not self._is_1d:
             self._precompute_velocity()
-    
+
     def _precompute_velocity(self) -> None:
         """Pre-interpolate 3D velocity to output grid."""
         logger.info("Pre-computing velocity on output grid...")
-        
+
         self._precomputed = self.model.get_vrms_volume(
             self.output_x_axis,
             self.output_y_axis,
             self.output_t_axis_ms,
+            x_grid=self.output_x_grid,
+            y_grid=self.output_y_grid,
         )
-        
+
         logger.info(
             f"Velocity grid: {self._precomputed.shape}, "
             f"range: [{self._precomputed.min():.0f}, {self._precomputed.max():.0f}] m/s"
@@ -609,30 +725,35 @@ def create_velocity_manager(
 ) -> VelocityManager:
     """
     Create a velocity manager from configuration.
-    
+
     Args:
         config: Velocity configuration
         output_grid: Output grid configuration
-        
+
     Returns:
         Configured VelocityManager
     """
     # Create velocity model
     model = create_velocity_model(config)
-    
-    # Create output axes
-    x_axis = np.arange(output_grid.x_min, output_grid.x_max + output_grid.dx / 2, output_grid.dx)
-    y_axis = np.arange(output_grid.y_min, output_grid.y_max + output_grid.dy / 2, output_grid.dy)
-    t_axis_ms = np.arange(
-        output_grid.t_min_ms, 
-        output_grid.t_max_ms + output_grid.dt_ms / 2, 
-        output_grid.dt_ms
-    )
-    
+
+    # Get output coordinates (handles both bounding-box and corner-point grids)
+    coords = output_grid.get_output_coordinates()
+    x_axis = coords['x']
+    y_axis = coords['y']
+    t_axis_ms = coords['t_ms']
+
+    # Get 2D coordinate grids for rotated grids
+    # These are None for axis-aligned grids but essential for rotated grids
+    # to ensure velocity is sampled at correct spatial locations
+    x_grid = coords.get('X')  # 2D grid (nx, ny)
+    y_grid = coords.get('Y')  # 2D grid (nx, ny)
+
     return VelocityManager(
         model=model,
         output_x_axis=x_axis,
         output_y_axis=y_axis,
         output_t_axis_ms=t_axis_ms,
         precompute=config.precompute_to_output_grid,
+        output_x_grid=x_grid,
+        output_y_grid=y_grid,
     )

@@ -28,6 +28,7 @@ def calculate_auto_tile_size(
     nx: int,
     ny: int,
     max_memory_gb: float = 8.0,
+    prefer_throughput: bool = False,
 ) -> tuple[int, int]:
     """
     Calculate optimal tile size based on memory budget and time depth.
@@ -40,6 +41,8 @@ def calculate_auto_tile_size(
         nx: Number of X bins in output grid
         ny: Number of Y bins in output grid
         max_memory_gb: Maximum memory budget in GB
+        prefer_throughput: If True, use larger tiles for better performance
+                          even if UI updates are less frequent
 
     Returns:
         (tile_nx, tile_ny) dimensions
@@ -56,18 +59,25 @@ def calculate_auto_tile_size(
     # Make roughly square tiles
     tile_size = int(np.sqrt(max_pillars))
 
-    # Adjust max tile size based on time depth for reasonable progress updates
-    # Deep data (high nt) takes longer per tile, so use smaller tiles
-    # Target: ~60-90 seconds per tile for reasonable UI feedback
-    if nt > 1000:
-        # Very deep data: use smaller tiles for ~60-90s updates
-        max_tile = 32
-    elif nt > 500:
-        # Medium depth: ~45-60s updates
-        max_tile = 48
+    if prefer_throughput:
+        # Throughput mode: use much larger tiles to reduce overhead
+        # Each trace is loaded fewer times with larger tiles
+        # Max tile is limited only by memory, not UI responsiveness
+        max_tile = 256  # Very large tiles
+        logger.debug("Tile planner: prefer_throughput mode, using larger tiles")
     else:
-        # Shallow data: ~10-15s updates
-        max_tile = 64
+        # Adjust max tile size based on time depth for reasonable progress updates
+        # Deep data (high nt) takes longer per tile, so use smaller tiles
+        # Target: ~60-90 seconds per tile for reasonable UI feedback
+        if nt > 1000:
+            # Very deep data: use smaller tiles for ~60-90s updates
+            max_tile = 32
+        elif nt > 500:
+            # Medium depth: ~45-60s updates
+            max_tile = 48
+        else:
+            # Shallow data: ~10-15s updates
+            max_tile = 64
 
     tile_size = max(32, min(tile_size, max_tile))
 
@@ -205,6 +215,7 @@ class TilePlanner:
         tiling_config: TilingConfig,
         max_memory_gb: float | None = None,
         aperture_radius: float | None = None,
+        prefer_throughput: bool = False,
     ):
         """
         Initialize the tile planner.
@@ -214,14 +225,17 @@ class TilePlanner:
             tiling_config: Tiling configuration
             max_memory_gb: Maximum memory budget for tiling (default from settings)
             aperture_radius: Aperture radius (default from settings)
+            prefer_throughput: If True, use larger tiles for better performance
+                              at the expense of less frequent UI updates
         """
         from pstm.settings import get_settings
         s = get_settings()
-        
+
         self.output_grid = output_grid
         self.tiling_config = tiling_config
         self.max_memory_gb = max_memory_gb if max_memory_gb is not None else s.tiling.max_memory_gb
         self.aperture_radius = aperture_radius if aperture_radius is not None else s.aperture.max_aperture_m
+        self.prefer_throughput = prefer_throughput
 
     def plan(self) -> TilePlan:
         """
@@ -284,13 +298,15 @@ class TilePlanner:
             nx=self.output_grid.nx,
             ny=self.output_grid.ny,
             max_memory_gb=self.max_memory_gb,
+            prefer_throughput=self.prefer_throughput,
         )
 
         bytes_per_pillar = self.output_grid.nt * 8  # float64
+        mode = "throughput" if self.prefer_throughput else "responsive"
         logger.debug(
             f"Auto tile size: {tile_nx}×{tile_ny} "
             f"({tile_nx * tile_ny * bytes_per_pillar / 1024**2:.1f} MB per tile) "
-            f"[nt={self.output_grid.nt}]"
+            f"[nt={self.output_grid.nt}, mode={mode}]"
         )
 
         return tile_nx, tile_ny
@@ -306,8 +322,13 @@ class TilePlanner:
         tiles = []
         tile_id = 0
 
-        dx = self.output_grid.dx
-        dy = self.output_grid.dy
+        # Get coordinate arrays (handles both bounding-box and corner-point grids)
+        coords = self.output_grid.get_output_coordinates()
+
+        # For rotated grids, we need to use the full 2D coordinate meshgrids
+        # to get correct bounding boxes for spatial queries
+        X_grid = coords.get('X')  # 2D meshgrid of X coordinates
+        Y_grid = coords.get('Y')  # 2D meshgrid of Y coordinates
 
         for iy in range(n_tiles_y):
             for ix in range(n_tiles_x):
@@ -317,11 +338,23 @@ class TilePlanner:
                 y_start = iy * tile_ny
                 y_end = min((iy + 1) * tile_ny, self.output_grid.ny)
 
-                # Coordinates
-                x_min = self.output_grid.x_min + x_start * dx
-                x_max = self.output_grid.x_min + (x_end - 1) * dx
-                y_min = self.output_grid.y_min + y_start * dy
-                y_max = self.output_grid.y_min + (y_end - 1) * dy
+                # Get actual coordinate bounds from 2D grids
+                # This correctly handles rotated grids where X,Y vary in both IL and XL
+                if X_grid is not None and Y_grid is not None:
+                    tile_X = X_grid[x_start:x_end, y_start:y_end]
+                    tile_Y = Y_grid[x_start:x_end, y_start:y_end]
+                    x_min = float(tile_X.min())
+                    x_max = float(tile_X.max())
+                    y_min = float(tile_Y.min())
+                    y_max = float(tile_Y.max())
+                else:
+                    # Fallback for axis-aligned grids (1D coordinates)
+                    x_coords = coords['x']
+                    y_coords = coords['y']
+                    x_min = x_coords[x_start]
+                    x_max = x_coords[x_end - 1]
+                    y_min = y_coords[y_start]
+                    y_max = y_coords[y_end - 1]
 
                 tiles.append(TileSpec(
                     tile_id=tile_id,

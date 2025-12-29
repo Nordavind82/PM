@@ -79,6 +79,13 @@ class ComputeBackend(str, Enum):
     METAL_COMPILED = "metal_compiled"  # PyObjC + compiled .metallib (fastest on Apple Silicon)
 
 
+class MigrationKernelType(str, Enum):
+    """Type of migration traveltime computation."""
+    STRAIGHT_RAY = "straight_ray"      # Standard DSR (default)
+    CURVED_RAY = "curved_ray"          # V(z) gradient model
+    ANISOTROPIC_VTI = "anisotropic_vti"  # Alkhalifah-Tsvankin eta
+
+
 class OutputFormat(str, Enum):
     """Output file format."""
     ZARR = "zarr"
@@ -462,6 +469,123 @@ class TimeVariantConfig(BaseConfig):
     )
 
 
+class CurvedRayConfig(BaseConfig):
+    """Configuration for curved ray migration.
+
+    Accounts for velocity gradient causing ray bending in V(z) = V0 + k*z media.
+    Rays follow circular arc paths instead of straight lines.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable curved ray traveltime computation",
+    )
+    gradient_source: Literal["from_velocity", "manual"] = Field(
+        default="from_velocity",
+        description="Source of velocity gradient (estimate from velocity or manual)",
+    )
+    # Manual gradient specification
+    v0_m_s: PositiveFloat | None = Field(
+        default=None,
+        description="Surface velocity V_0 (m/s) for manual gradient",
+    )
+    k_per_s: float | None = Field(
+        default=None,
+        description="Velocity gradient k (1/s), typical range 0.3-0.6",
+    )
+    # Gradient estimation parameters
+    gradient_estimation_window_ms: PositiveFloat = Field(
+        default=500.0,
+        description="Time window for gradient estimation from velocity (ms)",
+    )
+
+    @model_validator(mode="after")
+    def validate_manual_params(self) -> "CurvedRayConfig":
+        """Validate manual parameters when manual source is selected."""
+        if self.enabled and self.gradient_source == "manual":
+            if self.v0_m_s is None:
+                raise ValueError("v0_m_s required when gradient_source='manual'")
+            if self.k_per_s is None:
+                raise ValueError("k_per_s required when gradient_source='manual'")
+        return self
+
+
+class AnisotropyVTIConfig(BaseConfig):
+    """Configuration for VTI anisotropic migration.
+
+    Implements Alkhalifah-Tsvankin (1995) formulation for P-wave time processing
+    in vertically transversely isotropic media using the eta parameter.
+
+    η = (ε - δ) / (1 + 2δ) ≈ ε - δ for weak anisotropy
+
+    Typical values: 0.05-0.20 for shales and layered sediments.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable VTI anisotropic migration",
+    )
+    eta_source: Literal["constant", "table_1d", "cube_3d"] = Field(
+        default="constant",
+        description="Source of eta values",
+    )
+    # Constant eta
+    eta_constant: float = Field(
+        default=0.1,
+        ge=-0.5,
+        le=0.5,
+        description="Constant eta value (typical range: 0.05-0.20)",
+    )
+    # 1D eta table: (time_ms, eta) pairs
+    eta_table: list[tuple[float, float]] | None = Field(
+        default=None,
+        description="1D eta vs time table: [(time_ms, eta), ...]",
+    )
+    # 3D eta cube
+    eta_cube_path: Path | None = Field(
+        default=None,
+        description="Path to 3D eta cube (Zarr format)",
+    )
+
+    @field_validator("eta_table")
+    @classmethod
+    def validate_eta_table(cls, v: list[tuple[float, float]] | None) -> list[tuple[float, float]] | None:
+        """Validate eta table entries."""
+        if v is None:
+            return v
+
+        if len(v) < 2:
+            raise ValueError("Eta table must have at least 2 entries")
+
+        # Sort by time
+        v = sorted(v, key=lambda x: x[0])
+
+        # Check times are unique
+        times = [t for t, e in v]
+        if len(times) != len(set(times)):
+            raise ValueError("Times in eta table must be unique")
+
+        # Check eta values are in valid range
+        for t, eta in v:
+            if not -0.5 <= eta <= 0.5:
+                raise ValueError(f"Eta must be in range [-0.5, 0.5], got {eta} at t={t}")
+
+        return v
+
+    @model_validator(mode="after")
+    def validate_eta_source(self) -> "AnisotropyVTIConfig":
+        """Validate required fields for each eta source."""
+        if not self.enabled:
+            return self
+
+        if self.eta_source == "table_1d" and not self.eta_table:
+            raise ValueError("eta_table required when eta_source='table_1d'")
+        if self.eta_source == "cube_3d" and not self.eta_cube_path:
+            raise ValueError("eta_cube_path required when eta_source='cube_3d'")
+
+        return self
+
+
 class AmplitudeConfig(BaseConfig):
     """Configuration for amplitude handling."""
 
@@ -517,6 +641,12 @@ class MuteConfig(BaseConfig):
 class AlgorithmConfig(BaseConfig):
     """Configuration for migration algorithm parameters."""
 
+    # Kernel type selection
+    kernel_type: MigrationKernelType = Field(
+        default=MigrationKernelType.STRAIGHT_RAY,
+        description="Migration kernel traveltime model",
+    )
+
     # Core algorithm
     interpolation: InterpolationMethod = Field(
         default=InterpolationMethod.LINEAR,
@@ -530,6 +660,10 @@ class AlgorithmConfig(BaseConfig):
     mute: MuteConfig = Field(default_factory=MuteConfig)
     time_variant: TimeVariantConfig = Field(default_factory=TimeVariantConfig)
 
+    # Advanced kernel configurations
+    curved_ray: CurvedRayConfig = Field(default_factory=CurvedRayConfig)
+    anisotropy_vti: AnisotropyVTIConfig = Field(default_factory=AnisotropyVTIConfig)
+
 
 # =============================================================================
 # Output Configuration
@@ -538,6 +672,93 @@ class AlgorithmConfig(BaseConfig):
 # OutputGridConfig is now imported from output_grid.py for enhanced functionality
 # (supports corner-point definition for rotated grids)
 from pstm.config.output_grid import OutputGridConfig
+
+
+class GatherBinType(str, Enum):
+    """Type of gather bin for output."""
+    OFFSET = "offset"  # Common offset range (absolute offset)
+    OVT = "ovt"  # Offset Vector Tile (signed offset_x, offset_y ranges)
+
+
+class GatherBin(BaseConfig):
+    """
+    Unified gather bin definition supporting both offset ranges and OVT tiles.
+
+    Allows mixing common offset bins with OVT tiles in a single output run:
+      - Bin 0: offset 0-500m
+      - Bin 1: OVT X[-500,0] Y[-500,0]
+      - Bin 2: OVT X[0,500] Y[-500,0]
+      etc.
+    """
+    bin_type: GatherBinType = Field(
+        default=GatherBinType.OFFSET,
+        description="Type of bin: 'offset' for common offset range, 'ovt' for offset vector tile",
+    )
+    name: str | None = Field(
+        default=None,
+        description="Optional name for the bin (used in output file naming)",
+    )
+
+    # Offset range fields (used when bin_type == OFFSET)
+    offset_min: float | None = Field(
+        default=None,
+        description="Minimum absolute offset (meters). Used when bin_type='offset'.",
+    )
+    offset_max: float | None = Field(
+        default=None,
+        description="Maximum absolute offset (meters). Used when bin_type='offset'.",
+    )
+
+    # OVT fields (used when bin_type == OVT)
+    ovt_x_min: float | None = Field(
+        default=None,
+        description="Minimum offset_x (Rx-Sx, meters). Used when bin_type='ovt'.",
+    )
+    ovt_x_max: float | None = Field(
+        default=None,
+        description="Maximum offset_x (Rx-Sx, meters). Used when bin_type='ovt'.",
+    )
+    ovt_y_min: float | None = Field(
+        default=None,
+        description="Minimum offset_y (Ry-Sy, meters). Used when bin_type='ovt'.",
+    )
+    ovt_y_max: float | None = Field(
+        default=None,
+        description="Maximum offset_y (Ry-Sy, meters). Used when bin_type='ovt'.",
+    )
+
+    @classmethod
+    def offset_bin(cls, offset_min: float, offset_max: float, name: str | None = None) -> "GatherBin":
+        """Create an offset range bin."""
+        return cls(
+            bin_type=GatherBinType.OFFSET,
+            name=name or f"offset_{offset_min:.0f}_{offset_max:.0f}",
+            offset_min=offset_min,
+            offset_max=offset_max,
+        )
+
+    @classmethod
+    def ovt_bin(
+        cls, x_min: float, x_max: float, y_min: float, y_max: float, name: str | None = None
+    ) -> "GatherBin":
+        """Create an OVT tile bin."""
+        return cls(
+            bin_type=GatherBinType.OVT,
+            name=name or f"ovt_x{x_min:.0f}_{x_max:.0f}_y{y_min:.0f}_{y_max:.0f}",
+            ovt_x_min=x_min,
+            ovt_x_max=x_max,
+            ovt_y_min=y_min,
+            ovt_y_max=y_max,
+        )
+
+    def get_display_name(self) -> str:
+        """Get human-readable name for the bin."""
+        if self.name:
+            return self.name
+        if self.bin_type == GatherBinType.OFFSET:
+            return f"Offset {self.offset_min:.0f}-{self.offset_max:.0f}m"
+        else:
+            return f"OVT X[{self.ovt_x_min:.0f},{self.ovt_x_max:.0f}] Y[{self.ovt_y_min:.0f},{self.ovt_y_max:.0f}]"
 
 
 class OutputProductsConfig(BaseConfig):
@@ -559,14 +780,23 @@ class OutputProductsConfig(BaseConfig):
         default=None,
         description="Offset bin centers for CIGs (meters)",
     )
-    # Offset/azimuth gather output bins
+    # Unified gather bins (supports mixed offset and OVT bins)
+    gather_bins: list[GatherBin] | None = Field(
+        default=None,
+        description="List of gather bins (offset ranges and/or OVT tiles) for separate outputs",
+    )
+    # Legacy fields (for backward compatibility)
     output_gathers: bool = Field(
         default=False,
-        description="Output separate migrated volumes per offset/azimuth bin",
+        description="Output separate migrated volumes per bin (True if gather_bins is set)",
     )
     gather_offset_ranges: list[tuple[float, float]] | None = Field(
         default=None,
-        description="List of (min, max) offset ranges defining output gather bins (meters)",
+        description="[LEGACY] List of (min, max) offset ranges - prefer gather_bins",
+    )
+    ovt_output_tiles: list[tuple[int, int, float, float, float, float]] | None = Field(
+        default=None,
+        description="[LEGACY] List of OVT tiles - prefer gather_bins",
     )
     semblance_panels: bool = Field(
         default=False,

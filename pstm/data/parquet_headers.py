@@ -416,6 +416,99 @@ class ParquetHeaderManager:
 
         return trace_indices, midpoint_x, midpoint_y
 
+    def get_midpoints_with_offset_filter(
+        self,
+        offset_min: float | None = None,
+        offset_max: float | None = None,
+    ) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """
+        Get midpoint coordinates with Parquet-level offset predicate pushdown.
+
+        This is MUCH faster than loading all data then filtering, as Parquet
+        can skip entire row groups that don't match the filter.
+
+        Args:
+            offset_min: Minimum offset (absolute value). None = no minimum.
+            offset_max: Maximum offset (absolute value). None = no maximum.
+
+        Returns:
+            Tuple of (trace_indices, midpoint_x, midpoint_y, offset)
+            Only returns rows matching the offset filter.
+        """
+        if self._lazy_frame is None:
+            self.open()
+        assert self._lazy_frame is not None
+
+        # Build list of columns to select
+        select_cols = [
+            self.columns.trace_index,
+            self.columns.source_x,
+            self.columns.source_y,
+            self.columns.receiver_x,
+            self.columns.receiver_y,
+        ]
+
+        # Include offset column for filtering
+        offset_col = self.columns.offset
+        has_offset = offset_col and offset_col in self.schema
+        if has_offset:
+            select_cols.append(offset_col)
+
+        # Include scalar column if we need to apply it
+        if self.apply_scalar and self.scalar_column and self.scalar_column in self.schema:
+            select_cols.append(self.scalar_column)
+
+        # Build lazy frame with predicate pushdown
+        lf = self._lazy_frame.select(select_cols)
+
+        # Apply offset filter at Parquet level (predicate pushdown!)
+        if has_offset and (offset_min is not None or offset_max is not None):
+            if offset_min is not None and offset_max is not None:
+                lf = lf.filter(pl.col(offset_col).is_between(offset_min, offset_max))
+                logger.info(f"Parquet predicate pushdown: offset BETWEEN {offset_min:.0f} AND {offset_max:.0f}")
+            elif offset_min is not None:
+                lf = lf.filter(pl.col(offset_col) >= offset_min)
+                logger.info(f"Parquet predicate pushdown: offset >= {offset_min:.0f}")
+            elif offset_max is not None:
+                lf = lf.filter(pl.col(offset_col) <= offset_max)
+                logger.info(f"Parquet predicate pushdown: offset <= {offset_max:.0f}")
+
+        # Collect (now only loads matching rows!)
+        df = lf.collect()
+
+        n_loaded = len(df)
+        logger.info(f"Loaded {n_loaded:,} traces with offset filter (predicate pushdown)")
+
+        if n_loaded == 0:
+            return (
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+            )
+
+        # Apply scalar if configured
+        df = self._apply_scalar_if_needed(df)
+
+        trace_indices = df[self.columns.trace_index].to_numpy().astype(np.int64)
+        source_x = df[self.columns.source_x].to_numpy().astype(np.float64)
+        source_y = df[self.columns.source_y].to_numpy().astype(np.float64)
+        receiver_x = df[self.columns.receiver_x].to_numpy().astype(np.float64)
+        receiver_y = df[self.columns.receiver_y].to_numpy().astype(np.float64)
+
+        # Get or compute offset
+        if has_offset:
+            offset = df[offset_col].to_numpy().astype(np.float64)
+        else:
+            offset = compute_offset(source_x, source_y, receiver_x, receiver_y)
+
+        midpoint_x, midpoint_y = offset_to_midpoint(source_x, source_y, receiver_x, receiver_y)
+
+        logger.debug(f"get_midpoints_with_offset_filter: {n_loaded:,} traces, "
+                    f"midpoint_x range: {midpoint_x.min():.1f} - {midpoint_x.max():.1f}")
+
+        return trace_indices, midpoint_x, midpoint_y, offset
+
     def get_offset_range(
         self,
         min_offset: float,

@@ -13,27 +13,30 @@ struct MigrationParams {
     float dy;                    // Output grid spacing Y (meters)
     float dt_ms;                 // Time sampling (ms)
     float t_start_ms;            // Start time (ms)
-    
+
     // Aperture parameters
     float max_aperture;          // Maximum aperture (meters)
     float min_aperture;          // Minimum aperture (meters)
     float taper_fraction;        // Taper fraction (0-1)
     float max_dip_deg;           // Maximum dip angle (degrees)
-    
+
     // Amplitude correction flags
     int apply_spreading;         // Apply geometrical spreading
     int apply_obliquity;         // Apply obliquity factor
-    
+
     // Anti-aliasing parameters
     int apply_aa;                // Apply anti-aliasing
     float aa_dominant_freq;      // Dominant frequency for AA (Hz)
-    
+
     // Dimensions
     int n_traces;
     int n_samples;
     int nx;
     int ny;
     int nt;
+
+    // 3D velocity flag (added for lateral velocity variation support)
+    int use_3d_velocity;         // If 1, use 3D velocity cube [nx, ny, nt]
 };
 
 // =============================================================================
@@ -130,6 +133,7 @@ inline float compute_aa_weight(
 
 // =============================================================================
 // Main Migration Kernel - 3D Parallel (each thread = one output sample)
+// Supports both 1D velocity (time-only) and 3D velocity (x, y, t)
 // =============================================================================
 kernel void pstm_migrate_3d(
     // Input trace data
@@ -140,45 +144,56 @@ kernel void pstm_migrate_3d(
     device const float* receiver_y [[buffer(4)]],
     device const float* midpoint_x [[buffer(5)]],
     device const float* midpoint_y [[buffer(6)]],
-    
+
     // Output arrays
     device float* image [[buffer(7)]],                 // [nx, ny, nt] - non-atomic, unique per thread
     device atomic_int* fold [[buffer(8)]],             // [nx, ny]
-    
-    // Grid coordinates
-    device const float* x_coords [[buffer(9)]],        // [nx]
-    device const float* y_coords [[buffer(10)]],       // [ny]
-    
+
+    // Grid coordinates (flattened 2D for rotated grid support)
+    device const float* x_coords [[buffer(9)]],        // [nx*ny] flattened X coordinates
+    device const float* y_coords [[buffer(10)]],       // [nx*ny] flattened Y coordinates
+
     // Pre-computed time-dependent values
     device const float* t0_half_sq [[buffer(11)]],     // [nt] - (t0/2)^2
-    device const float* inv_v_sq [[buffer(12)]],       // [nt] - 1/v^2
+    device const float* inv_v_sq [[buffer(12)]],       // [nt] for 1D, [nx*ny*nt] for 3D velocity
     device const float* t0_s [[buffer(13)]],           // [nt] - t0 in seconds
     device const float* apertures [[buffer(14)]],      // [nt] - aperture at each time
-    
+
     // Parameters
     constant MigrationParams& params [[buffer(15)]],
-    
+
     // Thread position
     uint3 gid [[thread_position_in_grid]]
 ) {
     int ix = gid.x;
     int iy = gid.y;
     int it = gid.z;
-    
+
     // Bounds check
     if (ix >= params.nx || iy >= params.ny || it >= params.nt) {
         return;
     }
-    
-    // Get output point coordinates
-    float ox = x_coords[ix];
-    float oy = y_coords[iy];
-    
+
+    // Get output point coordinates (2D flattened indexing for rotated grids)
+    int coord_idx = ix * params.ny + iy;
+    float ox = x_coords[coord_idx];
+    float oy = y_coords[coord_idx];
+
     // Get time-dependent values for this output time
     float aperture = apertures[it];
     float t0_half_sq_val = t0_half_sq[it];
-    float inv_v_sq_val = inv_v_sq[it];
     float t0_val = t0_s[it];
+
+    // Get velocity - support both 1D and 3D velocity models
+    float inv_v_sq_val;
+    if (params.use_3d_velocity) {
+        // 3D velocity: index by (ix, iy, it) - same layout as output image
+        int vel_idx = ix * params.ny * params.nt + iy * params.nt + it;
+        inv_v_sq_val = inv_v_sq[vel_idx];
+    } else {
+        // 1D velocity: index by time only (center pillar for all x,y)
+        inv_v_sq_val = inv_v_sq[it];
+    }
     float velocity = 1.0f / sqrt(inv_v_sq_val);  // Recover velocity
     
     // Accumulator for this output sample
@@ -290,9 +305,11 @@ kernel void pstm_migrate_3d_simd(
     if (ix >= params.nx || iy >= params.ny || it >= params.nt) {
         return;
     }
-    
-    float ox = x_coords[ix];
-    float oy = y_coords[iy];
+
+    // Get output point coordinates (2D flattened indexing for rotated grids)
+    int coord_idx = ix * params.ny + iy;
+    float ox = x_coords[coord_idx];
+    float oy = y_coords[coord_idx];
     float aperture = apertures[it];
     float aperture_sq = aperture * aperture;
     float t0_half_sq_val = t0_half_sq[it];
@@ -492,6 +509,10 @@ struct TimeVariantParams {
     int ny;
     int n_windows;           // Number of time windows
     int total_output_samples; // Total output samples across all windows
+
+    // 3D velocity support
+    int use_3d_velocity;     // If 1, vrms is [nx*ny*nt_base] instead of [nt_base]
+    int nt_base;             // Number of time samples in velocity model
 };
 
 /**
@@ -515,9 +536,9 @@ kernel void pstm_migrate_time_variant(
     device float* image [[buffer(7)]],
     device atomic_int* fold [[buffer(8)]],
 
-    // Grid coordinates
-    device const float* x_coords [[buffer(9)]],
-    device const float* y_coords [[buffer(10)]],
+    // Grid coordinates (flattened 2D for rotated grid support)
+    device const float* x_coords [[buffer(9)]],    // [nx*ny] flattened X coordinates
+    device const float* y_coords [[buffer(10)]],   // [nx*ny] flattened Y coordinates
 
     // Velocity model (1D for now)
     device const float* vrms [[buffer(11)]],       // [nt_base] velocity at base sampling
@@ -557,19 +578,31 @@ kernel void pstm_migrate_time_variant(
     float t_out_ms = win.t_start_ms + local_sample * win.dt_effective_ms;
     float t_out_s = t_out_ms / 1000.0f;
 
-    // Get velocity at this time (interpolate from base sampling)
-    int velo_idx = int(t_out_ms / params.dt_base_ms);
-    velo_idx = min(velo_idx, params.n_samples - 1);
-    float velocity = vrms[velo_idx];
+    // Get output point coordinates (2D flattened indexing for rotated grids)
+    int coord_idx = ix * params.ny + iy;
+
+    // Get velocity at this time - support both 1D and 3D velocity models
+    int velo_t_idx = int(t_out_ms / params.dt_base_ms);
+    velo_t_idx = min(velo_t_idx, params.nt_base - 1);
+
+    float velocity;
+    if (params.use_3d_velocity) {
+        // 3D velocity: index by (ix, iy, t) - same layout as output image
+        int vel_idx = ix * params.ny * params.nt_base + iy * params.nt_base + velo_t_idx;
+        velocity = vrms[vel_idx];
+    } else {
+        // 1D velocity: index by time only
+        velocity = vrms[velo_t_idx];
+    }
 
     // Pre-compute values for DSR
     float t0_half = t_out_s / 2.0f;
     float t0_half_sq = t0_half * t0_half;
     float inv_v_sq = 1.0f / (velocity * velocity);
 
-    // Get output point coordinates
-    float ox = x_coords[ix];
-    float oy = y_coords[iy];
+    // Get output point coordinates (using coord_idx computed above)
+    float ox = x_coords[coord_idx];
+    float oy = y_coords[coord_idx];
 
     // Time-dependent aperture (simple linear model)
     float aperture = min(params.max_aperture, params.min_aperture + velocity * t_out_s * 0.5f);

@@ -15,25 +15,46 @@ echo "=============================================="
 
 mkdir -p "$BUILD_DIR"
 
-# Only compile the main unified shader
-METAL_FILE="$SHADER_DIR/pstm_migration.metal"
+# List of shader files to compile
+SHADER_FILES=(
+    "pstm_migration.metal"
+    "pstm_curved_ray.metal"
+    "pstm_anisotropic_vti.metal"
+    "pstm_trace_centric.metal"
+)
 
-if [ ! -f "$METAL_FILE" ]; then
-    echo "ERROR: $METAL_FILE not found"
+AIR_FILES=()
+
+# Compile each shader to .air
+for SHADER in "${SHADER_FILES[@]}"; do
+    METAL_FILE="$SHADER_DIR/$SHADER"
+    AIR_FILE="$BUILD_DIR/${SHADER%.metal}.air"
+
+    if [ ! -f "$METAL_FILE" ]; then
+        echo "WARNING: $METAL_FILE not found, skipping..."
+        continue
+    fi
+
+    echo "Compiling $SHADER..."
+    xcrun -sdk macosx metal \
+        -c "$METAL_FILE" \
+        -o "$AIR_FILE" \
+        -std=metal3.0 \
+        -O3 \
+        -ffast-math
+
+    AIR_FILES+=("$AIR_FILE")
+done
+
+if [ ${#AIR_FILES[@]} -eq 0 ]; then
+    echo "ERROR: No shader files compiled"
     exit 1
 fi
 
-echo "Compiling pstm_migration.metal..."
-xcrun -sdk macosx metal \
-    -c "$METAL_FILE" \
-    -o "$BUILD_DIR/pstm_migration.air" \
-    -std=metal3.0 \
-    -O3 \
-    -ffast-math
-
-echo "Linking to metallib..."
+echo ""
+echo "Linking ${#AIR_FILES[@]} shader(s) to metallib..."
 xcrun -sdk macosx metallib \
-    "$BUILD_DIR/pstm_migration.air" \
+    "${AIR_FILES[@]}" \
     -o "$OUTPUT_LIB"
 
 echo ""
@@ -41,4 +62,10 @@ echo "=============================================="
 echo "Build successful!"
 echo "Output: $OUTPUT_LIB"
 echo "Size: $(ls -lh "$OUTPUT_LIB" | awk '{print $5}')"
+echo "Shaders included:"
+for SHADER in "${SHADER_FILES[@]}"; do
+    if [ -f "$SHADER_DIR/$SHADER" ]; then
+        echo "  - $SHADER"
+    fi
+done
 echo "=============================================="

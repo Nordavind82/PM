@@ -1,0 +1,171 @@
+{
+  "input_data": {
+    "dataset_path": "/Users/olegadamovich/SeismicData/processing/processed_scd_xsd_data_new_20251221_225219_20251221_232357/output",
+    "traces_path": "/Users/olegadamovich/SeismicData/processing/processed_scd_xsd_data_new_20251221_225219_20251221_232357/output/traces.zarr",
+    "traces_format": "zarr",
+    "headers_path": "/Users/olegadamovich/SeismicData/processing/processed_scd_xsd_data_new_20251221_225219_20251221_232357/output/headers.parquet",
+    "headers_format": "parquet",
+    "col_source_x": "source_x",
+    "col_source_y": "source_y",
+    "col_receiver_x": "receiver_x",
+    "col_receiver_y": "receiver_y",
+    "col_midpoint_x": "",
+    "col_midpoint_y": "",
+    "col_offset": "offset",
+    "col_azimuth": "sr_azim",
+    "col_trace_index": "trace_index",
+    "col_scalar_coord": "scalar_coord",
+    "apply_coord_scalar": true,
+    "coord_scalar_value": -100,
+    "n_traces": 22324543,
+    "n_samples": 1600,
+    "sample_rate_ms": 2.0,
+    "is_loaded": true,
+    "traces_transposed": true
+  },
+  "survey": {
+    "x_min": 618801.19,
+    "x_max": 631293.06,
+    "y_min": 5106618.5,
+    "y_max": 5119979.5,
+    "offset_min": 0.06,
+    "offset_max": 19.91,
+    "offset_mean": 8.552441277745304,
+    "azimuth_min": 0.0,
+    "azimuth_max": 360.0,
+    "n_shots": 13514,
+    "n_sources": 13514,
+    "n_receivers": 30414,
+    "fold_computed": false,
+    "max_fold": 0,
+    "mean_fold": 0.0,
+    "spatial_index_built": false
+  },
+  "output_grid": {
+    "dx": 12.5,
+    "dy": 25.0,
+    "dt_ms": 2.0,
+    "t_min_ms": 0.0,
+    "t_max_ms": 2000.0,
+    "corners": {
+      "c1_x": 627753.46,
+      "c1_y": 5106192.26,
+      "c2_x": 632512.02,
+      "c2_y": 5111763.82,
+      "c3_x": 622202.12,
+      "c3_y": 5120569.31,
+      "c4_x": 617443.56,
+      "c4_y": 5114997.75
+    }
+  },
+  "velocity": {
+    "source": "constant",
+    "constant_velocity": 2500.0,
+    "linear_v0": 1800.0,
+    "linear_gradient": 0.5,
+    "function_1d_times": [],
+    "function_1d_values": [],
+    "cube_path": "",
+    "file_path": "",
+    "is_prepared": false,
+    "curved_ray_source": "from_velocity",
+    "curved_ray_v0": 1500.0,
+    "curved_ray_k": 0.5,
+    "vti_eta_source": "constant",
+    "vti_eta_constant": 0.1,
+    "vti_eta_table": [],
+    "vti_eta_cube_path": ""
+  },
+  "data_selection": {
+    "mode": "offset",
+    "offset_ranges": [
+      {
+        "min_offset": 0.0,
+        "max_offset": 2000.0
+      }
+    ],
+    "offset_include_mode": true,
+    "include_negative_offsets": true,
+    "azimuth_sectors": [],
+    "azimuth_convention": "receiver_relative",
+    "offset_x_min": null,
+    "offset_x_max": null,
+    "offset_y_min": null,
+    "offset_y_max": null,
+    "ovt_tile_size_x": 500.0,
+    "ovt_tile_size_y": 500.0,
+    "ovt_selected_tiles": [],
+    "custom_expression": "",
+    "total_traces": 22324543,
+    "selected_traces": 22324543
+  },
+  "algorithm": {
+    "max_aperture_m": 5000.0,
+    "min_aperture_m": 500.0,
+    "max_dip_degrees": 65.0,
+    "taper_type": "cosine",
+    "taper_fraction": 0.1,
+    "interpolation_method": "linear",
+    "apply_spreading": false,
+    "apply_obliquity": false,
+    "enable_antialiasing": false,
+    "trace_weighting": "none",
+    "phase_rotation": 0.0,
+    "mute_above_ms": 0.0,
+    "mute_below_ms": 10000.0,
+    "time_variant": {
+      "enabled": false,
+      "frequency_table": [
+        [
+          0.0,
+          80.0
+        ],
+        [
+          1000.0,
+          50.0
+        ],
+        [
+          2500.0,
+          30.0
+        ],
+        [
+          5000.0,
+          20.0
+        ]
+      ],
+      "min_downsample_factor": 1,
+      "max_downsample_factor": 8
+    },
+    "kernel_type": "straight_ray"
+  },
+  "execution": {
+    "backend": "metal_cpp",
+    "max_memory_gb": 32.0,
+    "n_threads": 0,
+    "auto_tile_size": true,
+    "tile_nx": 64,
+    "tile_ny": 64,
+    "tile_ordering": "snake",
+    "enable_checkpoint": true,
+    "checkpoint_interval_tiles": 10,
+    "checkpoint_interval_seconds": 300.0,
+    "resume_from_checkpoint": true,
+    "estimated_time_minutes": 0.0,
+    "estimated_tiles": 0
+  },
+  "output": {
+    "output_dir": "/Users/olegadamovich/SeismicData/PSTM_offset_bins",
+    "project_name": "migration_50m_offsets",
+    "output_stacked_image": true,
+    "output_fold_map": true,
+    "output_cig": true,
+    "output_segy": false,
+    "output_qc_report": true,
+    "cig_n_offset_bins": 40,
+    "cig_min_offset": 0.0,
+    "cig_max_offset": 2000.0,
+    "output_format": "zarr",
+    "output_dtype": "float32"
+  },
+  "current_step": 6
+}

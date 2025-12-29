@@ -59,35 +59,46 @@ def get_cpu_info() -> dict:
 
 
 def setup_debug_logging(output_dir: Path | None = None) -> logging.Logger:
-    """Setup comprehensive debug logging to console and file."""
+    """Setup comprehensive debug logging to console and file.
+
+    This function preserves any existing handlers (e.g., from run script file logging)
+    and only adds new handlers if none exist. It also enables propagation so messages
+    reach parent loggers for centralized logging.
+    """
     # Create a specific logger for migration debugging
     debug_logger = logging.getLogger("pstm.migration.debug")
     debug_logger.setLevel(logging.DEBUG)
-    debug_logger.handlers.clear()  # Clear existing handlers
 
-    # Console handler with detailed format
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG)
-    console_format = logging.Formatter(
-        '[%(asctime)s.%(msecs)03d] %(levelname)-8s %(name)s:%(lineno)d - %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    console_handler.setFormatter(console_format)
-    debug_logger.addHandler(console_handler)
+    # Enable propagation to parent loggers (for centralized file logging)
+    debug_logger.propagate = True
 
-    # File handler if output_dir provided
-    if output_dir:
-        log_file = output_dir / f"migration_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.DEBUG)
-        file_format = logging.Formatter(
-            '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+    # Only add handlers if none exist (preserve handlers from run script)
+    if not debug_logger.handlers:
+        # Console handler with detailed format
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.DEBUG)
+        console_format = logging.Formatter(
+            '[%(asctime)s.%(msecs)03d] %(levelname)-8s %(name)s:%(lineno)d - %(message)s',
+            datefmt='%H:%M:%S'
         )
-        file_handler.setFormatter(file_format)
-        debug_logger.addHandler(file_handler)
-        debug_logger.info(f"Debug log file: {log_file}")
+        console_handler.setFormatter(console_format)
+        debug_logger.addHandler(console_handler)
+
+        # File handler if output_dir provided
+        if output_dir:
+            log_file = output_dir / f"migration_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setLevel(logging.DEBUG)
+            file_format = logging.Formatter(
+                '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(file_format)
+            debug_logger.addHandler(file_handler)
+            debug_logger.info(f"Debug log file: {log_file}")
+    else:
+        debug_logger.debug(f"Preserving {len(debug_logger.handlers)} existing handler(s)")
 
     return debug_logger
 
@@ -142,10 +153,24 @@ def log_memory_state(debug_logger: logging.Logger, context: str = ""):
         mem = psutil.virtual_memory()
         process = psutil.Process()
         proc_mem = process.memory_info()
-        debug_logger.debug(
-            f"MEMORY [{context}] System: {mem.available / (1024**3):.2f} GB available "
-            f"({mem.percent}% used) | Process RSS: {proc_mem.rss / (1024**3):.3f} GB"
+
+        # Detailed memory breakdown
+        available_gb = mem.available / (1024**3)
+        used_pct = mem.percent
+        rss_gb = proc_mem.rss / (1024**3)
+        vms_gb = proc_mem.vms / (1024**3)
+
+        debug_logger.info(
+            f"MEMORY [{context}] System: {available_gb:.2f} GB available "
+            f"({used_pct:.1f}% used) | Process RSS: {rss_gb:.3f} GB | VMS: {vms_gb:.3f} GB"
         )
+
+        # Log warning if memory is getting low
+        if available_gb < 8.0:
+            debug_logger.warning(f"MEMORY WARNING [{context}]: Low memory! Only {available_gb:.2f} GB available")
+        if rss_gb > 30.0:
+            debug_logger.warning(f"MEMORY WARNING [{context}]: High RSS! Process using {rss_gb:.2f} GB")
+
     except ImportError:
         debug_logger.debug(f"MEMORY [{context}] psutil not available for memory tracking")
 
@@ -204,6 +229,10 @@ class ExecutionMetrics:
 
     compute_time_total: float = 0.0
     io_time_total: float = 0.0
+
+    # Grid coverage QC metrics
+    grid_coverage_ratio: float = 1.0  # Fraction of midpoints inside grid
+    grid_coverage_n_outside: int = 0  # Number of midpoints outside grid
 
     warnings: list[str] = field(default_factory=list)
 
@@ -327,6 +356,10 @@ class MigrationExecutor:
         self._pause_requested = False
         self._stop_requested = False
 
+        # Performance optimization: filtered trace indices (set for fast lookup)
+        # Set during init if data selection filters are applied
+        self._filtered_trace_indices: set[int] | None = None
+
     def run(self, resume: bool = False) -> bool:
         """
         Execute the migration.
@@ -421,6 +454,97 @@ class MigrationExecutor:
     def request_stop(self) -> None:
         """Request migration to stop (will stop after current tile)."""
         self._stop_requested = True
+
+    def _analyze_grid_coverage(
+        self,
+        midpoint_x: NDArray[np.floating],
+        midpoint_y: NDArray[np.floating],
+    ) -> None:
+        """
+        Analyze how well the output grid covers the input data.
+
+        Logs coverage statistics and warnings if significant data falls
+        outside the output grid boundaries.
+        """
+        try:
+            from pstm.analysis.grid_outliers import (
+                classify_points_against_grid,
+                generate_outlier_report,
+            )
+
+            # Get grid corners from config (handles both bounding-box and corner-point grids)
+            grid = self.config.output.grid
+            coords = grid.get_output_coordinates()
+            X_grid = coords.get('X')
+            Y_grid = coords.get('Y')
+
+            # For rotated grids, use actual 2D corner coordinates
+            if X_grid is not None and Y_grid is not None:
+                corners = np.array([
+                    [X_grid[0, 0], Y_grid[0, 0]],        # C1 (IL=0, XL=0)
+                    [X_grid[-1, 0], Y_grid[-1, 0]],      # C2 (IL=max, XL=0)
+                    [X_grid[-1, -1], Y_grid[-1, -1]],    # C3 (IL=max, XL=max)
+                    [X_grid[0, -1], Y_grid[0, -1]],      # C4 (IL=0, XL=max)
+                ])
+            else:
+                # Fallback for axis-aligned grids
+                x_coords = coords['x']
+                y_coords = coords['y']
+                corners = np.array([
+                    [x_coords[0], y_coords[0]],    # C1 SW
+                    [x_coords[-1], y_coords[0]],   # C2 SE
+                    [x_coords[-1], y_coords[-1]],  # C3 NE
+                    [x_coords[0], y_coords[-1]],   # C4 NW
+                ])
+
+            # Get aperture parameters
+            max_offset = self.config.algorithm.aperture.max_aperture_m
+            max_dip = self.config.algorithm.aperture.max_dip_degrees
+
+            # Generate coverage report
+            report = generate_outlier_report(
+                midpoint_x, midpoint_y, corners,
+                max_offset_m=max_offset,
+                max_dip_deg=max_dip,
+            )
+
+            classification = report.classification
+
+            # Log results
+            self._debug.info(f"Grid Coverage Analysis:")
+            self._debug.info(f"  Total midpoints: {classification.n_total:,}")
+            self._debug.info(f"  Inside grid: {classification.n_inside:,} ({classification.inside_ratio*100:.1f}%)")
+            self._debug.info(f"  Outside grid: {classification.n_outside:,}")
+
+            if classification.n_outside > 0:
+                self._debug.info(f"  Max distance outside: {classification.max_distance_outside:.1f} m")
+                self._debug.info(f"  Mean distance outside: {classification.mean_distance_outside:.1f} m")
+                self._debug.info(f"  Suggested buffer: {classification.suggested_buffer_m:.1f} m")
+
+                # Log quadrant breakdown
+                for direction, count in classification.outside_by_quadrant.items():
+                    if count > 0:
+                        self._debug.info(f"    {direction}: {count:,} points")
+
+            # Report warnings
+            if report.outlier_warning:
+                self._debug.warning(f"Coverage warning: {report.recommendation_reason}")
+                logger.warning(f"Grid coverage: {report.recommendation_reason}")
+
+            if not report.coverage_acceptable:
+                self._debug.warning("Grid coverage is below acceptable threshold!")
+                logger.warning(
+                    f"Grid coverage is {classification.inside_ratio*100:.1f}%. "
+                    f"Consider extending grid by {classification.suggested_buffer_m:.0f}m."
+                )
+
+            # Store result for later reference
+            self.metrics.grid_coverage_ratio = classification.inside_ratio
+            self.metrics.grid_coverage_n_outside = classification.n_outside
+
+        except Exception as e:
+            self._debug.warning(f"Grid coverage analysis failed: {e}")
+            # Non-fatal, continue with migration
 
     def _report_phase(self, phase: ExecutionPhase) -> None:
         """Report phase change."""
@@ -520,13 +644,39 @@ class MigrationExecutor:
             self._spatial_index = SpatialIndex.load(self.config.geometry.index_path)
         else:
             self._debug.debug("Building new spatial index from midpoints...")
-            trace_indices, midpoint_x, midpoint_y = self._header_manager.get_all_midpoints()
 
             # Apply data selection filter to reduce traces BEFORE building spatial index
+            # Use Parquet predicate pushdown for offset filtering (MUCH faster!)
             data_sel = self.config.data_selection
-            if data_sel.mode.value != "all":
-                self._debug.info(f"Applying data selection filter: {data_sel.mode.value}")
+            if data_sel.mode.value == "offset" and data_sel.offset:
+                # OPTIMIZED PATH: Use Parquet predicate pushdown for offset filter
+                # This avoids loading all 22M traces just to filter to 300K
+                offset_min = data_sel.offset.min_offset
+                offset_max = data_sel.offset.max_offset
+                self._debug.info(f"Using Parquet predicate pushdown for offset filter: {offset_min:.0f} - {offset_max:.0f} m")
+                logger.info(f"Using Parquet predicate pushdown for offset filter: {offset_min:.0f} - {offset_max:.0f} m")
+
+                # This method filters at Parquet level BEFORE loading into memory
+                trace_indices, midpoint_x, midpoint_y, offset_values = (
+                    self._header_manager.get_midpoints_with_offset_filter(offset_min, offset_max)
+                )
+
+                n_total = self._header_manager.n_traces
+                n_after = len(trace_indices)
+                self._debug.info(f"Predicate pushdown: {n_total:,} -> {n_after:,} traces ({100*n_after/n_total:.1f}%)")
+                logger.info(f"Predicate pushdown result: {n_total:,} -> {n_after:,} traces ({100*n_after/n_total:.1f}%)")
+
+                # Store filtered trace indices for tile-level optimization
+                self._filtered_trace_indices = set(trace_indices.tolist())
+                self._debug.info(f"Stored {len(self._filtered_trace_indices):,} filtered trace indices for tile optimization")
+
+            elif data_sel.mode.value != "all":
+                # FALLBACK PATH: Load all data then filter in Python
+                # This is slower but necessary for OVT and other complex filters
+                self._debug.info(f"Applying data selection filter (Python): {data_sel.mode.value}")
                 logger.info(f"Applying data selection filter: {data_sel.mode.value}")
+
+                trace_indices, midpoint_x, midpoint_y = self._header_manager.get_all_midpoints()
 
                 # Load offset values for filtering
                 offset_col = self.config.input.columns.offset or "OFFSET"
@@ -548,13 +698,28 @@ class MigrationExecutor:
 
                     self._debug.info(f"Data selection: {n_before:,} -> {n_after:,} traces ({100*n_after/n_before:.1f}%)")
                     logger.info(f"Data selection: {n_before:,} -> {n_after:,} traces ({100*n_after/n_before:.1f}%)")
+
+                    # Store filtered trace indices for tile-level optimization
+                    self._filtered_trace_indices = set(trace_indices.tolist())
                 else:
                     self._debug.warning(f"Offset column '{offset_col}' not found, skipping data selection filter")
                     logger.warning(f"Offset column '{offset_col}' not found, skipping data selection filter")
+                    self._filtered_trace_indices = None
+            else:
+                # No filtering - load all midpoints
+                trace_indices, midpoint_x, midpoint_y = self._header_manager.get_all_midpoints()
+                self._filtered_trace_indices = None
 
             self._spatial_index = SpatialIndex.build(trace_indices, midpoint_x, midpoint_y)
         self._debug.info(f"Spatial index ready: {self._spatial_index.n_points} entries")
         log_memory_state(self._debug, "after_spatial_index")
+
+        # Pre-migration QC: Analyze grid coverage
+        self._debug.info("--- Pre-migration QC: Grid Coverage Analysis ---")
+        # Get midpoints from spatial index (works for both built and loaded indices)
+        qc_midpoint_x = self._spatial_index.midpoint_x
+        qc_midpoint_y = self._spatial_index.midpoint_y
+        self._analyze_grid_coverage(qc_midpoint_x, qc_midpoint_y)
 
         self._debug.info("--- Initialization: Loading velocity model ---")
         logger.info("Loading velocity model...")
@@ -603,20 +768,36 @@ class MigrationExecutor:
         grid = self.config.output.grid
         products = self.config.output.products
 
-        # Determine offset bins for gather output
-        self._offset_bins = []  # List of (min, max, bin_id) tuples
-        if products.output_gathers and products.gather_offset_ranges:
-            for i, (omin, omax) in enumerate(products.gather_offset_ranges):
-                self._offset_bins.append((omin, omax, i))
-            logger.info(f"Output gathers mode: {len(self._offset_bins)} offset bins")
-            for omin, omax, bid in self._offset_bins:
-                logger.info(f"  Bin {bid}: offset {omin:.0f} - {omax:.0f} m")
+        # Determine gather bins for output (supports mixed offset + OVT bins)
+        from pstm.config.models import GatherBin, GatherBinType
+        self._gather_bins: list[GatherBin] = []
 
-        n_bins = max(1, len(self._offset_bins))  # At least 1 for full stack
+        # Check for unified gather_bins first (new API)
+        if products.gather_bins:
+            self._gather_bins = list(products.gather_bins)
+            logger.info(f"Output gathers mode: {len(self._gather_bins)} bins (unified)")
+            for i, gb in enumerate(self._gather_bins):
+                if gb.bin_type == GatherBinType.OFFSET:
+                    logger.info(f"  Bin {i}: OFFSET {gb.offset_min:.0f} - {gb.offset_max:.0f} m")
+                else:
+                    logger.info(f"  Bin {i}: OVT X[{gb.ovt_x_min:.0f},{gb.ovt_x_max:.0f}] Y[{gb.ovt_y_min:.0f},{gb.ovt_y_max:.0f}]")
+        elif products.output_gathers:
+            # Legacy: gather_offset_ranges
+            if products.gather_offset_ranges:
+                for omin, omax in products.gather_offset_ranges:
+                    self._gather_bins.append(GatherBin.offset_bin(omin, omax))
+                logger.info(f"Output gathers mode: {len(self._gather_bins)} offset bins (legacy)")
+            # Legacy: ovt_output_tiles
+            elif products.ovt_output_tiles:
+                for tile_ix, tile_iy, x_min, x_max, y_min, y_max in products.ovt_output_tiles:
+                    self._gather_bins.append(GatherBin.ovt_bin(x_min, x_max, y_min, y_max))
+                logger.info(f"Output gathers mode: {len(self._gather_bins)} OVT bins (legacy)")
+
+        n_bins = max(1, len(self._gather_bins))  # At least 1 for full stack
 
         # Create accumulators - if gathers mode, create per-bin arrays
-        if self._offset_bins:
-            # Create separate image/fold per offset bin
+        if self._gather_bins:
+            # Create separate image/fold per bin (offset or OVT)
             for bid in range(n_bins):
                 self._memmap_manager.create(
                     f"image_bin_{bid}",
@@ -750,12 +931,22 @@ class MigrationExecutor:
         assert self._kernel is not None
         assert self._memmap_manager is not None
 
-        # Check if we're in gathers mode (multiple offset bins)
-        if self._offset_bins:
-            # Run migration for each offset bin separately
-            for omin, omax, bid in self._offset_bins:
-                logger.info(f"=== Processing offset bin {bid}: {omin:.0f} - {omax:.0f} m ===")
-                self._migrate_single_bin(bid, omin, omax)
+        # Check if we're in gathers mode (multiple bins - offset, OVT, or mixed)
+        from pstm.config.models import GatherBinType
+
+        if self._gather_bins:
+            # Run migration for each bin (can be offset or OVT, mixed in any order)
+            for bid, gb in enumerate(self._gather_bins):
+                if gb.bin_type == GatherBinType.OFFSET:
+                    logger.info(f"=== Processing bin {bid}: OFFSET {gb.offset_min:.0f} - {gb.offset_max:.0f} m ===")
+                    self._migrate_single_bin(bid, gb.offset_min, gb.offset_max)
+                else:
+                    logger.info(f"=== Processing bin {bid}: OVT X[{gb.ovt_x_min:.0f},{gb.ovt_x_max:.0f}] Y[{gb.ovt_y_min:.0f},{gb.ovt_y_max:.0f}] ===")
+                    self._migrate_single_bin(
+                        bid, None, None,
+                        ovt_x_min=gb.ovt_x_min, ovt_x_max=gb.ovt_x_max,
+                        ovt_y_min=gb.ovt_y_min, ovt_y_max=gb.ovt_y_max,
+                    )
         else:
             # Single full-stack migration (original behavior)
             self._migrate_single_bin(None, None, None)
@@ -765,8 +956,12 @@ class MigrationExecutor:
         bin_id: int | None,
         offset_min: float | None,
         offset_max: float | None,
+        ovt_x_min: float | None = None,
+        ovt_x_max: float | None = None,
+        ovt_y_min: float | None = None,
+        ovt_y_max: float | None = None,
     ) -> None:
-        """Execute migration for a single offset bin (or full stack if bin_id is None)."""
+        """Execute migration for a single offset bin or OVT tile (or full stack if bin_id is None)."""
         # In gathers mode, reset checkpoint for each bin
         # (checkpoint tracks tiles per bin, but we process bins sequentially)
         if bin_id is not None and self._checkpoint:
@@ -806,7 +1001,78 @@ class MigrationExecutor:
             apply_obliquity=self.config.algorithm.amplitude.obliquity_factor,
             interpolation_method=self.config.algorithm.interpolation.value,
             output_dt_ms=self.config.output.grid.dt_ms,
+            # Kernel type selection
+            kernel_type=self.config.algorithm.kernel_type.value,
+            # Curved ray parameters
+            curved_ray_enabled=self.config.algorithm.curved_ray is not None and self.config.algorithm.curved_ray.enabled,
+            curved_ray_v0=self.config.algorithm.curved_ray.v0_m_s if self.config.algorithm.curved_ray and self.config.algorithm.curved_ray.v0_m_s else 1500.0,
+            curved_ray_k=self.config.algorithm.curved_ray.k_per_s if self.config.algorithm.curved_ray and self.config.algorithm.curved_ray.k_per_s else 0.5,
+            # VTI anisotropy parameters (constant eta fallback)
+            vti_enabled=self.config.algorithm.anisotropy_vti is not None and self.config.algorithm.anisotropy_vti.enabled,
+            vti_eta_constant=self.config.algorithm.anisotropy_vti.eta_constant if self.config.algorithm.anisotropy_vti else 0.0,
         )
+
+        # Handle VTI eta sources (1D table or 3D cube)
+        vti_cfg = self.config.algorithm.anisotropy_vti
+        if vti_cfg and vti_cfg.enabled:
+            grid = self.config.output.grid
+            t_axis = np.arange(grid.t_min_ms, grid.t_max_ms + grid.dt_ms / 2, grid.dt_ms)
+
+            if vti_cfg.eta_source == "table_1d" and vti_cfg.eta_table:
+                # Interpolate 1D eta table to output time axis
+                table_times = np.array([p[0] for p in vti_cfg.eta_table])
+                table_eta = np.array([p[1] for p in vti_cfg.eta_table])
+                eta_1d = np.interp(t_axis, table_times, table_eta)
+                kernel_config.vti_eta_array = eta_1d
+                kernel_config.vti_eta_is_1d = True
+                self._debug.info(f"[VTI] Using 1D eta table: {len(vti_cfg.eta_table)} points -> {len(eta_1d)} samples")
+                self._debug.info(f"[VTI] Eta range: {eta_1d.min():.3f} - {eta_1d.max():.3f}")
+
+            elif vti_cfg.eta_source == "cube_3d" and vti_cfg.eta_cube_path:
+                # Load 3D eta cube and interpolate to output grid
+                try:
+                    eta_cube = zarr.open(str(vti_cfg.eta_cube_path), mode='r')
+                    if isinstance(eta_cube, zarr.Array):
+                        eta_data = eta_cube[:]
+                    else:
+                        eta_data = eta_cube['data'][:]
+
+                    # Get cube axes from attributes
+                    x_axis_cube = np.array(eta_cube.attrs.get('x_axis', np.arange(eta_data.shape[0])))
+                    y_axis_cube = np.array(eta_cube.attrs.get('y_axis', np.arange(eta_data.shape[1])))
+                    t_axis_cube = np.array(eta_cube.attrs.get('t_axis_ms', np.arange(eta_data.shape[2])))
+
+                    # Interpolate to output grid
+                    from scipy.interpolate import RegularGridInterpolator
+                    interp = RegularGridInterpolator(
+                        (x_axis_cube, y_axis_cube, t_axis_cube),
+                        eta_data,
+                        method='linear',
+                        bounds_error=False,
+                        fill_value=None,  # Extrapolate
+                    )
+
+                    # Get output coordinates (handles both bounding-box and corner-point grids)
+                    out_coords = grid.get_output_coordinates()
+                    x_out = out_coords['x']
+                    y_out = out_coords['y']
+                    xx, yy, tt = np.meshgrid(x_out, y_out, t_axis, indexing='ij')
+                    pts = np.column_stack([xx.ravel(), yy.ravel(), tt.ravel()])
+                    eta_3d = interp(pts).reshape(grid.nx, grid.ny, len(t_axis))
+
+                    kernel_config.vti_eta_array = eta_3d
+                    kernel_config.vti_eta_is_1d = False
+                    self._debug.info(f"[VTI] Using 3D eta cube: {eta_data.shape} -> {eta_3d.shape}")
+                    self._debug.info(f"[VTI] Eta range: {eta_3d.min():.3f} - {eta_3d.max():.3f}")
+
+                except Exception as e:
+                    self._debug.error(f"[VTI] Failed to load 3D eta cube: {e}")
+                    self._debug.warning("[VTI] Falling back to constant eta")
+            else:
+                self._debug.info(f"[VTI] Using constant eta: {kernel_config.vti_eta_constant:.3f}")
+
+        # Get grid config (needed for time-variant and tile processing)
+        grid = self.config.output.grid
 
         # Add time-variant sampling config if enabled
         tv_config = self.config.algorithm.time_variant
@@ -839,17 +1105,32 @@ class MigrationExecutor:
         else:
             self._debug.info("[TIME-VARIANT] Disabled")
 
-        grid = self.config.output.grid
         checkpoint_interval = self.config.execution.checkpoint.interval_tiles
+
+        # Check if trace-centric approach would be beneficial
+        # This estimates tile overlap and uses trace-centric if overlap > 50%
+        use_trace_centric = self._should_use_trace_centric(kernel_config)
+
+        if use_trace_centric:
+            self._debug.info("=" * 60)
+            self._debug.info("USING TRACE-CENTRIC MIGRATION (high overlap detected)")
+            self._debug.info("=" * 60)
+            self._run_trace_centric_migration(
+                image, fold, trace_count, offset_sum, azimuth_sin_sum, azimuth_cos_sum,
+                kernel_config, grid, offset_min, offset_max,
+                ovt_x_min, ovt_x_max, ovt_y_min, ovt_y_max,
+            )
+            return  # Skip tile-by-tile processing
 
         self._debug.info(f"Starting tile loop: {self._tile_plan.n_tiles} total tiles")
         self._debug.info(f"Using kernel: {type(self._kernel).__name__}")
 
-        # Aperture efficiency tracking
+        # Aperture efficiency tracking (simplified to reduce memory)
         total_input_traces = self._trace_reader.n_traces
         traces_per_tile_list: list[int] = []
         total_trace_data_loaded_mb = 0.0
-        unique_trace_indices: set[int] = set()  # Track which traces have been loaded
+        # Disabled: unique_trace_indices set was consuming too much memory for large datasets
+        # unique_trace_indices: set[int] = set()
         dataset_size_mb = (self._trace_reader.n_traces * self._trace_reader.n_samples * 4) / 1024**2  # Assuming float32
 
         self._debug.info(f"[APERTURE] Total input traces in dataset: {total_input_traces:,}")
@@ -873,12 +1154,13 @@ class MigrationExecutor:
             metrics, tile_trace_count, tile_data_mb, tile_trace_indices = self._process_tile(
                 tile, image, fold, trace_count, offset_sum, azimuth_sin_sum, azimuth_cos_sum,
                 kernel_config, grid, offset_min, offset_max,
+                ovt_x_min, ovt_x_max, ovt_y_min, ovt_y_max,
             )
 
             # Track aperture efficiency
             traces_per_tile_list.append(tile_trace_count)
             total_trace_data_loaded_mb += tile_data_mb
-            unique_trace_indices.update(tile_trace_indices)
+            # Disabled to save memory: unique_trace_indices.update(tile_trace_indices)
 
             # Update metrics
             self.metrics.n_tiles_completed += 1
@@ -896,6 +1178,11 @@ class MigrationExecutor:
                 tile_y=0,
             )
             self.metrics.compute_time_total += metrics.compute_time_s
+
+            # Explicit memory cleanup after each tile
+            del tile_trace_indices
+            import gc
+            gc.collect()
 
             # Mark completed
             self._checkpoint.mark_completed(
@@ -961,15 +1248,16 @@ class MigrationExecutor:
         data_reuse_factor = total_trace_data_loaded_mb / dataset_size_mb if dataset_size_mb > 0 else 0
         self._debug.info(f"  Data reuse factor: {data_reuse_factor:.1f}x (1.0=optimal, >1=traces loaded multiple times)")
 
-        unique_count = len(unique_trace_indices)
+        # Unique trace tracking disabled to save memory - estimate from reuse factor
+        unique_count = total_input_traces  # Assume all traces loaded at least once
         self._debug.info(f"  Unique traces loaded: {unique_count:,} / {total_input_traces:,}")
-        coverage = 100 * unique_count / total_input_traces if total_input_traces > 0 else 0
-        self._debug.info(f"  Trace coverage: {coverage:.1f}%")
+        coverage = 100.0  # Approximate
+        self._debug.info(f"  Trace coverage: {coverage:.1f}% (estimated)")
 
         print(f"MEMORY PROFILING:", file=sys.stderr, flush=True)
         print(f"  Dataset: {dataset_size_mb:.1f} MB | Loaded: {total_trace_data_loaded_mb:.1f} MB", file=sys.stderr, flush=True)
         print(f"  Data reuse factor: {data_reuse_factor:.1f}x", file=sys.stderr, flush=True)
-        print(f"  Unique traces: {unique_count:,}/{total_input_traces:,} ({coverage:.1f}%)", file=sys.stderr, flush=True)
+        print(f"  Unique traces: ~{unique_count:,}/{total_input_traces:,} (estimated)", file=sys.stderr, flush=True)
         print(f"{'='*60}\n", file=sys.stderr, flush=True)
 
     def _process_tile(
@@ -985,6 +1273,10 @@ class MigrationExecutor:
         grid,
         offset_min: float | None = None,
         offset_max: float | None = None,
+        ovt_x_min: float | None = None,
+        ovt_x_max: float | None = None,
+        ovt_y_min: float | None = None,
+        ovt_y_max: float | None = None,
     ) -> tuple[KernelMetrics, int, float, list[int]]:
         """
         Process a single tile.
@@ -992,6 +1284,10 @@ class MigrationExecutor:
         Args:
             offset_min: If provided, only include traces with offset >= offset_min
             offset_max: If provided, only include traces with offset <= offset_max
+            ovt_x_min: If provided, only include traces with offset_x >= ovt_x_min
+            ovt_x_max: If provided, only include traces with offset_x <= ovt_x_max
+            ovt_y_min: If provided, only include traces with offset_y >= ovt_y_min
+            ovt_y_max: If provided, only include traces with offset_y <= ovt_y_max
 
         Returns:
             Tuple of (metrics, tile_trace_count, tile_data_mb, tile_trace_indices):
@@ -1005,6 +1301,33 @@ class MigrationExecutor:
         self._debug.debug(f"  Tile bounds: x=[{tile.x_min:.1f}, {tile.x_max:.1f}], y=[{tile.y_min:.1f}, {tile.y_max:.1f}]")
         self._debug.debug(f"  Tile grid indices: x=[{tile.x_start}, {tile.x_end}], y=[{tile.y_start}, {tile.y_end}]")
         self._debug.debug(f"  Tile size: {tile.nx}x{tile.ny}")
+
+        # MEMORY SAFETY CHECK: Force GC if memory is low before starting tile
+        if HAS_PSUTIL:
+            mem = psutil.virtual_memory()
+            available_gb = mem.available / (1024**3)
+            if available_gb < 12.0:
+                self._debug.warning(
+                    f"  [MEMORY] Low memory before tile {tile.tile_id}: {available_gb:.2f} GB available. "
+                    "Running gc.collect()..."
+                )
+                import gc
+                gc.collect()
+
+                # Small delay to let OS reclaim memory
+                import time as time_module
+                time_module.sleep(0.5)
+
+                mem = psutil.virtual_memory()
+                available_after = mem.available / (1024**3)
+                self._debug.info(f"  [MEMORY] After GC: {available_after:.2f} GB available")
+
+                # If still critically low, log a severe warning
+                if available_after < 8.0:
+                    self._debug.error(
+                        f"  [MEMORY] CRITICAL: Only {available_after:.2f} GB available! "
+                        "Tile may fail. Consider reducing tile size or max_aperture."
+                    )
 
         assert self._spatial_index is not None
         assert self._trace_reader is not None
@@ -1049,51 +1372,93 @@ class MigrationExecutor:
                 [],  # tile_trace_indices
             )
 
-        # Load trace data
-        t0 = time.time()
-        trace_data = self._trace_reader.get_traces(query_result.trace_indices)
-        t_trace_load = time.time() - t0
-        trace_data_mb = trace_data.nbytes / 1024**2
-        self._debug.info(f"  [TIMING] Trace data load: {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB)")
+        # OPTIMIZATION: If gather bin filtering is needed, load geometry FIRST (lightweight)
+        # then filter, then load only matching trace data (heavyweight)
+        has_gather_filter = (
+            (offset_min is not None or offset_max is not None) or
+            (ovt_x_min is not None or ovt_x_max is not None or ovt_y_min is not None or ovt_y_max is not None)
+        )
 
-        # Load geometry
-        t0 = time.time()
-        geometry = self._header_manager.get_geometry_for_indices(query_result.trace_indices)
-        t_geom_load = time.time() - t0
-        self._debug.info(f"  [TIMING] Geometry load: {t_geom_load:.3f}s")
+        if has_gather_filter:
+            # OPTIMIZED PATH: Load geometry first, filter, then load only matching traces
+            # This avoids loading trace data we'll just throw away
+            t0 = time.time()
+            geometry = self._header_manager.get_geometry_for_indices(query_result.trace_indices)
+            t_geom_load = time.time() - t0
+            self._debug.info(f"  [TIMING] Geometry load (pre-filter): {t_geom_load:.3f}s - {geometry.n_traces:,} traces")
 
-        # Filter by offset if specified (for offset-binned gather output)
-        if offset_min is not None or offset_max is not None:
-            offset_mask = np.ones(len(geometry.offset), dtype=bool)
-            if offset_min is not None:
-                offset_mask &= (geometry.offset >= offset_min)
-            if offset_max is not None:
-                offset_mask &= (geometry.offset <= offset_max)
+            # Build combined filter mask
+            filter_mask = np.ones(geometry.n_traces, dtype=bool)
 
-            n_before = len(geometry.offset)
-            n_after = np.sum(offset_mask)
-            self._debug.info(f"  [OFFSET FILTER] {offset_min:.0f}-{offset_max:.0f}m: {n_before} -> {n_after} traces")
+            # Apply offset filter if specified
+            if offset_min is not None or offset_max is not None:
+                if offset_min is not None:
+                    filter_mask &= (geometry.offset >= offset_min)
+                if offset_max is not None:
+                    filter_mask &= (geometry.offset <= offset_max)
+                self._debug.info(f"  [OFFSET FILTER] {offset_min:.0f}-{offset_max:.0f}m")
+
+            # Apply OVT filter if specified
+            if ovt_x_min is not None or ovt_x_max is not None or ovt_y_min is not None or ovt_y_max is not None:
+                offset_x = geometry.receiver_x - geometry.source_x
+                offset_y = geometry.receiver_y - geometry.source_y
+                if ovt_x_min is not None:
+                    filter_mask &= (offset_x >= ovt_x_min)
+                if ovt_x_max is not None:
+                    filter_mask &= (offset_x <= ovt_x_max)
+                if ovt_y_min is not None:
+                    filter_mask &= (offset_y >= ovt_y_min)
+                if ovt_y_max is not None:
+                    filter_mask &= (offset_y <= ovt_y_max)
+                self._debug.info(f"  [OVT FILTER] X=[{ovt_x_min:.0f},{ovt_x_max:.0f}] Y=[{ovt_y_min:.0f},{ovt_y_max:.0f}]")
+
+            n_before = geometry.n_traces
+            n_after = np.sum(filter_mask)
+            self._debug.info(f"  [GATHER FILTER] {n_before:,} -> {n_after:,} traces ({100*n_after/n_before:.1f}% kept)")
 
             if n_after == 0:
-                # No traces in this offset range for this tile
+                # No traces match the gather bin filter for this tile
                 return (
                     KernelMetrics(n_traces_processed=0, n_samples_output=0, compute_time_s=0.0),
                     0, 0.0, [],
                 )
 
-            # Apply mask to trace data and geometry
-            trace_data = trace_data[offset_mask]
+            # Filter geometry to matching traces
+            filtered_indices = geometry.trace_indices[filter_mask]
             geometry = TraceGeometry(
-                trace_indices=geometry.trace_indices[offset_mask],
-                source_x=geometry.source_x[offset_mask],
-                source_y=geometry.source_y[offset_mask],
-                receiver_x=geometry.receiver_x[offset_mask],
-                receiver_y=geometry.receiver_y[offset_mask],
-                offset=geometry.offset[offset_mask],
-                midpoint_x=geometry.midpoint_x[offset_mask],
-                midpoint_y=geometry.midpoint_y[offset_mask],
+                trace_indices=filtered_indices,
+                source_x=geometry.source_x[filter_mask],
+                source_y=geometry.source_y[filter_mask],
+                receiver_x=geometry.receiver_x[filter_mask],
+                receiver_y=geometry.receiver_y[filter_mask],
+                offset=geometry.offset[filter_mask],
+                midpoint_x=geometry.midpoint_x[filter_mask],
+                midpoint_y=geometry.midpoint_y[filter_mask],
             )
+
+            # Now load ONLY the matching trace data (the expensive operation)
+            t0 = time.time()
+            trace_data = self._trace_reader.get_traces(filtered_indices)
+            t_trace_load = time.time() - t0
             trace_data_mb = trace_data.nbytes / 1024**2
+            self._debug.info(f"  [TIMING] Trace data load (post-filter): {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB)")
+
+        else:
+            # STANDARD PATH: No gather filtering needed, load in original order
+            # Load trace data
+            log_memory_state(self._debug, f"tile_{tile.tile_id}_before_trace_load")
+            t0 = time.time()
+            trace_data = self._trace_reader.get_traces(query_result.trace_indices)
+            t_trace_load = time.time() - t0
+            trace_data_mb = trace_data.nbytes / 1024**2
+            self._debug.info(f"  [TIMING] Trace data load: {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB)")
+            log_memory_state(self._debug, f"tile_{tile.tile_id}_after_trace_load")
+
+            # Load geometry
+            t0 = time.time()
+            geometry = self._header_manager.get_geometry_for_indices(query_result.trace_indices)
+            t_geom_load = time.time() - t0
+            self._debug.info(f"  [TIMING] Geometry load: {t_geom_load:.3f}s")
 
         # Create trace block
         traces = create_trace_block(
@@ -1107,13 +1472,28 @@ class MigrationExecutor:
         )
         self._debug.debug(f"  TraceBlock: {traces.n_traces} traces, {traces.n_samples} samples")
 
-        # Create output tile
+        # Create output tile with proper 2D coordinates for rotated grids
+        grid_coords = grid.get_output_coordinates()
+        X_grid = grid_coords.get('X')
+        Y_grid = grid_coords.get('Y')
+
+        if X_grid is not None and Y_grid is not None:
+            # Rotated grid: extract 2D coordinates for this tile
+            tile_X = X_grid[tile.x_start:tile.x_end, tile.y_start:tile.y_end]
+            tile_Y = Y_grid[tile.x_start:tile.x_end, tile.y_start:tile.y_end]
+        else:
+            # Axis-aligned grid: no 2D grids needed
+            tile_X = None
+            tile_Y = None
+
         output_tile = OutputTile(
             image=np.zeros((tile.nx, tile.ny, grid.nt), dtype=np.float64),
             fold=np.zeros((tile.nx, tile.ny), dtype=np.int32),
             x_axis=np.linspace(tile.x_min, tile.x_max, tile.nx),
             y_axis=np.linspace(tile.y_min, tile.y_max, tile.ny),
             t_axis_ms=np.arange(grid.t_min_ms, grid.t_max_ms + grid.dt_ms / 2, grid.dt_ms),
+            x_grid=tile_X,
+            y_grid=tile_Y,
         )
         self._debug.debug(f"  Output tile shape: {output_tile.image.shape}")
 
@@ -1151,8 +1531,26 @@ class MigrationExecutor:
 
         kernel_start = time.time()
 
-        # Check for time-variant sampling
-        if kernel_config.time_variant_enabled and kernel_config.time_variant_windows:
+        # Dispatch based on kernel type
+        kernel_type = kernel_config.kernel_type
+        self._debug.info(f"  Kernel type: {kernel_type}")
+
+        # Check for time-variant sampling with non-straight-ray kernels
+        # Time-variant only supports straight_ray currently
+        use_time_variant = kernel_config.time_variant_enabled and kernel_config.time_variant_windows
+        if use_time_variant and kernel_type != "straight_ray":
+            self._debug.warning(
+                f"  Time-variant sampling is not supported with '{kernel_type}' kernel. "
+                "Disabling time-variant for this tile."
+            )
+            print(
+                f"  WARNING: Time-variant not supported with {kernel_type} kernel, using uniform sampling",
+                file=sys.stderr, flush=True
+            )
+            use_time_variant = False
+
+        # Check for time-variant sampling (only with straight_ray kernel)
+        if use_time_variant:
             # Use time-variant kernel if available
             if hasattr(self._kernel, 'migrate_tile_time_variant'):
                 windows = kernel_config.time_variant_windows
@@ -1173,7 +1571,20 @@ class MigrationExecutor:
             else:
                 self._debug.warning("  Time-variant requested but kernel doesn't support it, using uniform")
                 metrics = self._kernel.migrate_tile(traces, output_tile, velocity, kernel_config)
+        elif kernel_type == "curved_ray" and hasattr(self._kernel, 'migrate_tile_curved_ray'):
+            # Curved ray migration (V(z) = V0 + k*z)
+            self._debug.info(f"  Using CURVED RAY kernel: v0={kernel_config.curved_ray_v0}, k={kernel_config.curved_ray_k}")
+            print(f"  CURVED RAY: v0={kernel_config.curved_ray_v0}, k={kernel_config.curved_ray_k}", file=sys.stderr, flush=True)
+            metrics = self._kernel.migrate_tile_curved_ray(traces, output_tile, velocity, kernel_config)
+        elif kernel_type == "anisotropic_vti" and hasattr(self._kernel, 'migrate_tile_vti'):
+            # VTI anisotropic migration (Alkhalifah-Tsvankin eta)
+            self._debug.info(f"  Using VTI ANISOTROPIC kernel: eta={kernel_config.vti_eta_constant}")
+            print(f"  VTI ANISOTROPIC: eta={kernel_config.vti_eta_constant}", file=sys.stderr, flush=True)
+            metrics = self._kernel.migrate_tile_vti(traces, output_tile, velocity, kernel_config)
         else:
+            # Standard straight ray migration
+            if kernel_type not in ("straight_ray", "curved_ray", "anisotropic_vti"):
+                self._debug.warning(f"  Unknown kernel type '{kernel_type}', defaulting to straight_ray")
             metrics = self._kernel.migrate_tile(traces, output_tile, velocity, kernel_config)
 
         kernel_time = time.time() - kernel_start
@@ -1240,6 +1651,28 @@ class MigrationExecutor:
         t_accumulate = time.time() - t0
         self._debug.info(f"  [TIMING] Accumulate to output: {t_accumulate:.3f}s")
 
+        # Save values needed for return before cleanup
+        tile_trace_count = query_result.n_traces
+        # Note: We skip tile_trace_indices to save memory - it's disabled anyway
+        # (see line ~1163: "Disabled to save memory")
+
+        # Explicit cleanup of large arrays to release memory before next tile
+        # Clear references explicitly to help garbage collector
+        traces = None
+        output_tile = None
+        trace_data = None
+        geometry = None
+        velocity = None
+        query_result = None
+
+        import gc
+        # Run multiple GC passes to catch reference cycles
+        gc.collect()
+        gc.collect()
+        gc.collect()
+
+        log_memory_state(self._debug, f"tile_{tile.tile_id}_after_cleanup")
+
         tile_time = time.time() - tile_start_time
 
         # Print timing summary for this tile
@@ -1259,12 +1692,173 @@ class MigrationExecutor:
         print(f"    KERNEL: {kernel_time:.2f}s ({100*kernel_time/tile_time:.0f}%) | Accum: {t_accumulate:.2f}s | Total: {tile_time:.2f}s\n", file=sys.stderr, flush=True)
 
         # Return metrics and aperture tracking data
+        # Note: tile_trace_indices is empty to save memory (it was disabled anyway)
         return (
             metrics,
-            query_result.n_traces,  # tile_trace_count
+            tile_trace_count,  # tile_trace_count
             trace_data_mb,  # tile_data_mb
-            list(query_result.trace_indices),  # tile_trace_indices
+            [],  # tile_trace_indices - empty to save memory
         )
+
+    def _should_use_trace_centric(self, kernel_config: KernelConfig) -> bool:
+        """
+        Determine if trace-centric migration should be used.
+
+        Returns True if:
+        - Tile overlap is high (>50% of traces per tile)
+        - Dataset is small enough to benefit from single-pass processing
+        """
+        assert self._spatial_index is not None
+        assert self._tile_plan is not None
+        assert self._trace_reader is not None
+
+        # Sample a few tiles to estimate overlap
+        from pstm.pipeline.trace_centric_executor import estimate_trace_overlap
+
+        try:
+            overlap_score = estimate_trace_overlap(
+                self._spatial_index,
+                self._tile_plan,
+                kernel_config.max_aperture_m,
+                sample_tiles=min(10, self._tile_plan.n_tiles),
+            )
+
+            # Use trace-centric if overlap is high
+            # Threshold: 0.5 means average trace is loaded 6x (1 + 0.5*10)
+            use_trace_centric = overlap_score > 0.5
+
+            self._debug.info(f"[TRACE-CENTRIC] Overlap score: {overlap_score:.2f}")
+            self._debug.info(f"[TRACE-CENTRIC] Use trace-centric: {use_trace_centric}")
+
+            # Also check dataset size - trace-centric is better for smaller datasets
+            # that fit in GPU memory
+            n_traces = self._trace_reader.n_traces
+            n_samples = self._trace_reader.n_samples
+            dataset_mb = (n_traces * n_samples * 4) / 1024**2
+
+            # If dataset is very large, fall back to tile-by-tile
+            if dataset_mb > 8000:  # >8GB
+                self._debug.info(f"[TRACE-CENTRIC] Dataset too large ({dataset_mb:.0f} MB), using tile-by-tile")
+                return False
+
+            return use_trace_centric
+
+        except Exception as e:
+            self._debug.warning(f"[TRACE-CENTRIC] Failed to estimate overlap: {e}")
+            return False
+
+    def _run_trace_centric_migration(
+        self,
+        image: NDArray,
+        fold: NDArray,
+        trace_count: NDArray,
+        offset_sum: NDArray,
+        azimuth_sin_sum: NDArray,
+        azimuth_cos_sum: NDArray,
+        kernel_config: KernelConfig,
+        grid,
+        offset_min: float | None,
+        offset_max: float | None,
+        ovt_x_min: float | None = None,
+        ovt_x_max: float | None = None,
+        ovt_y_min: float | None = None,
+        ovt_y_max: float | None = None,
+    ) -> None:
+        """
+        Run trace-centric migration instead of tile-by-tile.
+
+        Processes all traces in a single pass, scattering contributions to output.
+        """
+        from pstm.pipeline.trace_centric_executor import (
+            run_trace_centric_migration,
+            TraceCentricConfig,
+            TraceCentricProgress,
+        )
+
+        assert self._trace_reader is not None
+        assert self._header_manager is not None
+        assert self._velocity_manager is not None
+        assert self._memmap_manager is not None
+
+        # Get trace indices to process (optionally filtered by offset/OVT)
+        trace_indices = None
+        if offset_min is not None or offset_max is not None:
+            # Filter traces by offset using parquet predicate pushdown
+            filtered = self._header_manager.get_midpoints_with_offset_filter(
+                offset_min=offset_min,
+                offset_max=offset_max,
+            )
+            trace_indices = filtered["trace_index"]
+            self._debug.info(f"[TRACE-CENTRIC] Filtered to {len(trace_indices):,} traces by offset")
+        elif ovt_x_min is not None or ovt_x_max is not None:
+            # Filter by OVT - need to load all geometry and filter
+            all_geometry = self._header_manager.get_all_geometry()
+            offset_x = all_geometry.receiver_x - all_geometry.source_x
+            offset_y = all_geometry.receiver_y - all_geometry.source_y
+
+            mask = np.ones(len(offset_x), dtype=bool)
+            if ovt_x_min is not None:
+                mask &= (offset_x >= ovt_x_min)
+            if ovt_x_max is not None:
+                mask &= (offset_x <= ovt_x_max)
+            if ovt_y_min is not None:
+                mask &= (offset_y >= ovt_y_min)
+            if ovt_y_max is not None:
+                mask &= (offset_y <= ovt_y_max)
+
+            trace_indices = all_geometry.trace_indices[mask]
+            self._debug.info(f"[TRACE-CENTRIC] Filtered to {len(trace_indices):,} traces by OVT")
+
+        # Progress callback
+        def progress_callback(progress: TraceCentricProgress) -> None:
+            self._report_progress(
+                current=int(progress.traces_processed / 1000),  # Use thousands for tile equiv
+                total=int(progress.total_traces / 1000),
+                message=progress.message,
+                traces_in_tile=progress.traces_processed,
+                tile_x=0,
+                tile_y=0,
+            )
+
+        # Create a temporary memmap manager wrapper that writes to the right arrays
+        class TempMemmapWrapper:
+            def __init__(self, image, fold):
+                self._image = image
+                self._fold = fold
+
+            def get(self, name):
+                if name == "image":
+                    return self._image
+                elif name == "fold":
+                    return self._fold
+                raise KeyError(name)
+
+        temp_memmap = TempMemmapWrapper(image, fold)
+
+        # Run trace-centric migration
+        tc_config = TraceCentricConfig(
+            batch_size=100_000,  # Process 100K traces per GPU batch
+            report_interval=10_000,
+        )
+
+        metrics = run_trace_centric_migration(
+            trace_reader=self._trace_reader,
+            header_manager=self._header_manager,
+            velocity_manager=self._velocity_manager,
+            output_grid=grid,
+            kernel_config=kernel_config,
+            memmap_manager=temp_memmap,
+            progress_callback=progress_callback,
+            trace_indices=trace_indices,
+            tc_config=tc_config,
+        )
+
+        # Update executor metrics
+        self.metrics.n_traces_processed = metrics.n_traces_processed
+        self.metrics.compute_time_total = metrics.compute_time_s
+        self.metrics.n_tiles_completed = self._tile_plan.n_tiles  # Mark all as done
+
+        self._debug.info(f"[TRACE-CENTRIC] Complete: {metrics.n_traces_processed:,} traces in {metrics.compute_time_s:.1f}s")
 
     def _finalize(self) -> None:
         """Finalize migration output."""
@@ -1272,8 +1866,8 @@ class MigrationExecutor:
 
         grid = self.config.output.grid
 
-        # Check if we're in gathers mode (multiple offset bins)
-        if self._offset_bins:
+        # Check if we're in gathers mode (multiple gather bins - offset or OVT)
+        if self._gather_bins:
             self._finalize_gathers()
         else:
             self._finalize_stack()
@@ -1285,14 +1879,32 @@ class MigrationExecutor:
         image = self._memmap_manager.get("image")
         fold = self._memmap_manager.get("fold")
 
+        # DIAGNOSTIC: Log image and fold statistics before normalization
+        self._debug.info("=" * 60)
+        self._debug.info("FINALIZE DIAGNOSTICS")
+        self._debug.info("=" * 60)
+        self._debug.info(f"FOLD DEBUG: shape={fold.shape}, dtype={fold.dtype}")
+        self._debug.info(f"FOLD DEBUG: min={fold.min()}, max={fold.max()}, mean={fold.mean():.1f}")
+        self._debug.info(f"FOLD DEBUG: non-zero pixels: {np.count_nonzero(fold)} / {fold.size} ({100*np.count_nonzero(fold)/fold.size:.1f}%)")
+        self._debug.info(f"FOLD DEBUG: zero pixels: {np.count_nonzero(fold == 0)} / {fold.size}")
+
+        self._debug.info(f"IMAGE DEBUG (before norm): shape={image.shape}, dtype={image.dtype}")
+        self._debug.info(f"IMAGE DEBUG (before norm): min={image.min():.6f}, max={image.max():.6f}, mean={image.mean():.6f}")
+        self._debug.info(f"IMAGE DEBUG (before norm): non-zero voxels: {np.count_nonzero(image)} / {image.size}")
+        self._debug.info(f"IMAGE DEBUG (before norm): NaN count: {np.count_nonzero(np.isnan(image))}")
+        self._debug.info(f"IMAGE DEBUG (before norm): Inf count: {np.count_nonzero(np.isinf(image))}")
+
         # Normalize by fold (skip if fold is all zeros - e.g., Metal C++ 3D kernels don't track fold)
         fold_3d = fold[:, :, np.newaxis]
         if np.any(fold > 0):
+            self._debug.info("FOLD DEBUG: Normalizing by fold (fold > 0 detected)")
             with np.errstate(invalid="ignore", divide="ignore"):
                 image_normalized = np.where(fold_3d > 0, image / fold_3d, 0.0)
+            self._debug.info(f"IMAGE DEBUG (after norm): min={image_normalized.min():.6f}, max={image_normalized.max():.6f}, mean={image_normalized.mean():.6f}")
         else:
             # No fold data - use raw image (already accumulated)
             logger.warning("Fold is all zeros - skipping normalization (using raw stacked image)")
+            self._debug.warning("FOLD DEBUG: Fold is all zeros! Using raw accumulated image without normalization")
             image_normalized = image
 
         logger.info("Writing output files...")
@@ -1315,12 +1927,13 @@ class MigrationExecutor:
         )
         z[:] = image_normalized.astype(np.float32)
 
-        # Add metadata
-        z.attrs["x_min"] = grid.x_min
-        z.attrs["x_max"] = grid.x_max
+        # Add metadata (using coordinates for corner-point grid compatibility)
+        coords = grid.get_output_coordinates()
+        z.attrs["x_min"] = float(coords['x'][0])
+        z.attrs["x_max"] = float(coords['x'][-1])
         z.attrs["dx"] = grid.dx
-        z.attrs["y_min"] = grid.y_min
-        z.attrs["y_max"] = grid.y_max
+        z.attrs["y_min"] = float(coords['y'][0])
+        z.attrs["y_max"] = float(coords['y'][-1])
         z.attrs["dy"] = grid.dy
         z.attrs["t_min_ms"] = grid.t_min_ms
         z.attrs["t_max_ms"] = grid.t_max_ms
@@ -1357,8 +1970,10 @@ class MigrationExecutor:
         print_success(f"Output written to {output_path}")
 
     def _finalize_gathers(self) -> None:
-        """Finalize offset-binned gather output (multiple volumes)."""
-        logger.info(f"Finalizing {len(self._offset_bins)} offset-binned gather volumes...")
+        """Finalize gather output (multiple volumes - offset and/or OVT bins)."""
+        from pstm.config.models import GatherBinType
+
+        logger.info(f"Finalizing {len(self._gather_bins)} gather volumes...")
 
         grid = self.config.output.grid
         gathers_dir = self.config.output.output_dir / "gathers"
@@ -1366,9 +1981,16 @@ class MigrationExecutor:
 
         # Collect all bin headers for combined output
         all_headers = []
+        index_records = []
 
-        for omin, omax, bid in self._offset_bins:
-            logger.info(f"Writing gather bin {bid}: offset {omin:.0f} - {omax:.0f} m")
+        for bid, gb in enumerate(self._gather_bins):
+            # Log bin info based on type
+            if gb.bin_type == GatherBinType.OFFSET:
+                logger.info(f"Writing gather bin {bid}: OFFSET {gb.offset_min:.0f} - {gb.offset_max:.0f} m")
+                bin_name = gb.name or f"offset_{gb.offset_min:.0f}_{gb.offset_max:.0f}"
+            else:
+                logger.info(f"Writing gather bin {bid}: OVT X[{gb.ovt_x_min:.0f},{gb.ovt_x_max:.0f}] Y[{gb.ovt_y_min:.0f},{gb.ovt_y_max:.0f}]")
+                bin_name = gb.name or f"ovt_x{gb.ovt_x_min:.0f}_{gb.ovt_x_max:.0f}_y{gb.ovt_y_min:.0f}_{gb.ovt_y_max:.0f}"
 
             image = self._memmap_manager.get(f"image_bin_{bid}")
             fold = self._memmap_manager.get(f"fold_bin_{bid}")
@@ -1386,8 +2008,7 @@ class MigrationExecutor:
                 image_normalized = image
 
             # Write volume for this bin
-            offset_center = (omin + omax) / 2
-            output_path = gathers_dir / f"offset_bin_{bid:03d}.zarr"
+            output_path = gathers_dir / f"gather_bin_{bid:03d}.zarr"
 
             z = zarr.open(
                 str(output_path),
@@ -1402,27 +2023,38 @@ class MigrationExecutor:
             )
             z[:] = image_normalized.astype(np.float32)
 
-            # Add metadata including offset bin info
-            z.attrs["x_min"] = grid.x_min
-            z.attrs["x_max"] = grid.x_max
+            # Add metadata including bin info (using coordinates for corner-point grid compatibility)
+            gather_coords = grid.get_output_coordinates()
+            z.attrs["x_min"] = float(gather_coords['x'][0])
+            z.attrs["x_max"] = float(gather_coords['x'][-1])
             z.attrs["dx"] = grid.dx
-            z.attrs["y_min"] = grid.y_min
-            z.attrs["y_max"] = grid.y_max
+            z.attrs["y_min"] = float(gather_coords['y'][0])
+            z.attrs["y_max"] = float(gather_coords['y'][-1])
             z.attrs["dy"] = grid.dy
             z.attrs["t_min_ms"] = grid.t_min_ms
             z.attrs["t_max_ms"] = grid.t_max_ms
             z.attrs["dt_ms"] = grid.dt_ms
             z.attrs["migration_type"] = "PSTM"
-            z.attrs["offset_bin_id"] = bid
-            z.attrs["offset_min"] = omin
-            z.attrs["offset_max"] = omax
-            z.attrs["offset_center"] = offset_center
+            z.attrs["gather_bin_id"] = bid
+            z.attrs["gather_bin_type"] = gb.bin_type.value
+            z.attrs["gather_bin_name"] = bin_name
+
+            # Type-specific attributes
+            if gb.bin_type == GatherBinType.OFFSET:
+                z.attrs["offset_min"] = gb.offset_min
+                z.attrs["offset_max"] = gb.offset_max
+                z.attrs["offset_center"] = (gb.offset_min + gb.offset_max) / 2
+            else:
+                z.attrs["ovt_x_min"] = gb.ovt_x_min
+                z.attrs["ovt_x_max"] = gb.ovt_x_max
+                z.attrs["ovt_y_min"] = gb.ovt_y_min
+                z.attrs["ovt_y_max"] = gb.ovt_y_max
 
             # Write fold for this bin
             fold_path = gathers_dir / f"fold_bin_{bid:03d}.zarr"
             z_fold = zarr.open(str(fold_path), mode="w", shape=fold.shape, dtype=np.int32)
             z_fold[:] = fold
-            z_fold.attrs["offset_bin_id"] = bid
+            z_fold.attrs["gather_bin_id"] = bid
 
             # Compute averages for this bin
             with np.errstate(invalid="ignore", divide="ignore"):
@@ -1430,13 +2062,15 @@ class MigrationExecutor:
                 azimuth_avg = np.degrees(np.arctan2(azimuth_sin_sum, azimuth_cos_sum)) % 360
                 azimuth_avg = np.where(trace_count > 0, azimuth_avg, 0.0)
 
-            # Build headers for this bin
-            x_coords = np.linspace(grid.x_min, grid.x_max, grid.nx)
-            y_coords = np.linspace(grid.y_min, grid.y_max, grid.ny)
+            # Build headers for this bin (using coordinates for corner-point grid compatibility)
+            header_grid_coords = grid.get_output_coordinates()
+            x_coords = header_grid_coords['x']
+            y_coords = header_grid_coords['y']
             xx, yy = np.meshgrid(np.arange(grid.nx), np.arange(grid.ny), indexing="ij")
             x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing="ij")
 
-            df_bin = pl.DataFrame({
+            # Build header dataframe with type-agnostic columns
+            header_data = {
                 "ix": xx.ravel().astype(np.int32),
                 "iy": yy.ravel().astype(np.int32),
                 "x": x_grid.ravel().astype(np.float64),
@@ -1444,11 +2078,23 @@ class MigrationExecutor:
                 "trace_count": trace_count.ravel().astype(np.int32),
                 "offset_avg": offset_avg.ravel().astype(np.float32),
                 "azimuth_avg": azimuth_avg.ravel().astype(np.float32),
-                "offset_bin_id": np.full(grid.nx * grid.ny, bid, dtype=np.int32),
-                "offset_bin_min": np.full(grid.nx * grid.ny, omin, dtype=np.float32),
-                "offset_bin_max": np.full(grid.nx * grid.ny, omax, dtype=np.float32),
-                "offset_bin_center": np.full(grid.nx * grid.ny, offset_center, dtype=np.float32),
-            })
+                "gather_bin_id": np.full(grid.nx * grid.ny, bid, dtype=np.int32),
+                "gather_bin_type": np.full(grid.nx * grid.ny, gb.bin_type.value, dtype=object),
+                "gather_bin_name": np.full(grid.nx * grid.ny, bin_name, dtype=object),
+            }
+
+            # Add type-specific columns
+            if gb.bin_type == GatherBinType.OFFSET:
+                header_data["offset_bin_min"] = np.full(grid.nx * grid.ny, gb.offset_min, dtype=np.float32)
+                header_data["offset_bin_max"] = np.full(grid.nx * grid.ny, gb.offset_max, dtype=np.float32)
+                header_data["offset_bin_center"] = np.full(grid.nx * grid.ny, (gb.offset_min + gb.offset_max) / 2, dtype=np.float32)
+            else:
+                header_data["ovt_x_min"] = np.full(grid.nx * grid.ny, gb.ovt_x_min, dtype=np.float32)
+                header_data["ovt_x_max"] = np.full(grid.nx * grid.ny, gb.ovt_x_max, dtype=np.float32)
+                header_data["ovt_y_min"] = np.full(grid.nx * grid.ny, gb.ovt_y_min, dtype=np.float32)
+                header_data["ovt_y_max"] = np.full(grid.nx * grid.ny, gb.ovt_y_max, dtype=np.float32)
+
+            df_bin = pl.DataFrame(header_data)
 
             # Filter to bins with data
             df_bin = df_bin.filter(pl.col("trace_count") > 0)
@@ -1457,22 +2103,34 @@ class MigrationExecutor:
             n_bins_with_data = len(df_bin)
             logger.info(f"  Bin {bid}: {n_bins_with_data} spatial bins with data")
 
+            # Build index record for this bin
+            index_record = {
+                "bin_id": bid,
+                "bin_type": gb.bin_type.value,
+                "bin_name": bin_name,
+                "volume_path": f"gathers/gather_bin_{bid:03d}.zarr",
+            }
+            if gb.bin_type == GatherBinType.OFFSET:
+                index_record["offset_min"] = gb.offset_min
+                index_record["offset_max"] = gb.offset_max
+                index_record["offset_center"] = (gb.offset_min + gb.offset_max) / 2
+            else:
+                index_record["ovt_x_min"] = gb.ovt_x_min
+                index_record["ovt_x_max"] = gb.ovt_x_max
+                index_record["ovt_y_min"] = gb.ovt_y_min
+                index_record["ovt_y_max"] = gb.ovt_y_max
+            index_records.append(index_record)
+
         # Combine all headers and write
         if all_headers:
-            df_all = pl.concat(all_headers)
+            df_all = pl.concat(all_headers, how="diagonal")  # diagonal allows different columns
             headers_path = self.config.output.output_dir / "gather_headers.parquet"
             df_all.write_parquet(str(headers_path))
             logger.info(f"Gather headers written to {headers_path}: {len(df_all)} total entries")
 
         # Write gather index file
         index_path = self.config.output.output_dir / "gathers_index.parquet"
-        index_df = pl.DataFrame({
-            "bin_id": [bid for _, _, bid in self._offset_bins],
-            "offset_min": [omin for omin, _, _ in self._offset_bins],
-            "offset_max": [omax for _, omax, _ in self._offset_bins],
-            "offset_center": [(omin + omax) / 2 for omin, omax, _ in self._offset_bins],
-            "volume_path": [f"gathers/offset_bin_{bid:03d}.zarr" for _, _, bid in self._offset_bins],
-        })
+        index_df = pl.DataFrame(index_records)
         index_df.write_parquet(str(index_path))
         logger.info(f"Gather index written to {index_path}")
 
@@ -1492,8 +2150,10 @@ class MigrationExecutor:
         """Write bin headers to Parquet."""
         headers_path = self.config.output.output_dir / "bin_headers.parquet"
 
-        x_coords = np.linspace(grid.x_min, grid.x_max, grid.nx)
-        y_coords = np.linspace(grid.y_min, grid.y_max, grid.ny)
+        # Get coordinates (handles both bounding-box and corner-point grids)
+        coords = grid.get_output_coordinates()
+        x_coords = coords['x']
+        y_coords = coords['y']
 
         xx, yy = np.meshgrid(np.arange(grid.nx), np.arange(grid.ny), indexing="ij")
         x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing="ij")

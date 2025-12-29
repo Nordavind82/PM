@@ -34,7 +34,8 @@ class AlgorithmStep(WizardStepWidget):
         left_widget = QFrame()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 10, 0)
-        
+
+        self._create_kernel_type_section(left_layout)
         self._create_aperture_section(left_layout)
         self._create_interpolation_section(left_layout)
         self._create_amplitude_section(left_layout)
@@ -56,7 +57,51 @@ class AlgorithmStep(WizardStepWidget):
         splitter.setSizes([500, 400])
         
         self.content_layout.addWidget(splitter)
-    
+
+    def _create_kernel_type_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create migration kernel type selection section."""
+        frame, layout = self.create_section("Migration Kernel Type")
+
+        info = self.create_info_box(
+            "Select traveltime computation method. Curved ray accounts for velocity gradients. "
+            "VTI anisotropic uses Alkhalifah-Tsvankin eta parameter for non-hyperbolic moveout.",
+            "info"
+        )
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        # Kernel type selection
+        self.kernel_type = QComboBox()
+        self.kernel_type.addItems([
+            "Straight Ray (Isotropic)",
+            "Curved Ray (V(z) gradient)",
+            "Anisotropic VTI (Eta parameter)",
+        ])
+        self.kernel_type.setCurrentIndex(0)
+        self.kernel_type.currentIndexChanged.connect(self._on_kernel_type_changed)
+        form.addRow("Kernel Type:", self.kernel_type)
+
+        layout.addLayout(form)
+
+        # Info label about parameter configuration
+        self.kernel_params_info = QLabel(
+            "Configure gradient and eta parameters in the Velocity step."
+        )
+        self.kernel_params_info.setStyleSheet("color: #888888; font-size: 11px;")
+        self.kernel_params_info.setVisible(False)
+        layout.addWidget(self.kernel_params_info)
+
+        parent_layout.addWidget(frame)
+
+    def _on_kernel_type_changed(self, index: int) -> None:
+        """Handle kernel type selection change."""
+        # 0 = Straight Ray, 1 = Curved Ray, 2 = VTI Anisotropic
+        # Show info label for non-isotropic kernels
+        self.kernel_params_info.setVisible(index > 0)
+        self._on_param_changed()
+
     def _create_aperture_section(self, parent_layout: QVBoxLayout) -> None:
         """Create aperture configuration section."""
         frame, layout = self.create_section("Migration Aperture")
@@ -418,7 +463,12 @@ class AlgorithmStep(WizardStepWidget):
     def _get_summary_text(self) -> str:
         """Generate parameter summary."""
         tv_status = "Yes" if self.tv_enabled.isChecked() else "No"
-        return (
+        kernel_idx = self.kernel_type.currentIndex()
+        kernel_names = ["Straight Ray", "Curved Ray", "VTI Anisotropic"]
+        kernel_name = kernel_names[kernel_idx]
+
+        summary = (
+            f"Kernel Type:    {kernel_name}\n"
             f"Max Dip:        {self.max_dip_spin.value():.0f}°\n"
             f"Aperture:       {self.min_aperture_spin.value():.0f} - {self.max_aperture_spin.value():.0f} m\n"
             f"Taper:          {self.taper_type.currentText()} ({self.taper_fraction.value():.0%})\n"
@@ -428,6 +478,7 @@ class AlgorithmStep(WizardStepWidget):
             f"Anti-aliasing:  {'Yes' if self.enable_aa.isChecked() else 'No'}\n"
             f"Time-Variant:   {tv_status}"
         )
+        return summary
     
     def _on_param_changed(self) -> None:
         """Update summary when parameters change."""
@@ -473,6 +524,11 @@ Recommendation:
         """Load state into UI."""
         state = self.controller.state.algorithm
 
+        # Load kernel type
+        kernel_type_map = {"straight_ray": 0, "curved_ray": 1, "anisotropic_vti": 2}
+        self.kernel_type.setCurrentIndex(kernel_type_map.get(state.kernel_type, 0))
+        self._on_kernel_type_changed(self.kernel_type.currentIndex())
+
         self.max_dip_spin.setValue(state.max_dip_degrees)
         self.min_aperture_spin.setValue(state.min_aperture_m)
         self.max_aperture_spin.setValue(state.max_aperture_m)
@@ -502,6 +558,10 @@ Recommendation:
     def on_leave(self) -> None:
         """Save UI to state."""
         state = self.controller.state.algorithm
+
+        # Save kernel type
+        kernel_type_map = {0: "straight_ray", 1: "curved_ray", 2: "anisotropic_vti"}
+        state.kernel_type = kernel_type_map.get(self.kernel_type.currentIndex(), "straight_ray")
 
         state.max_dip_degrees = self.max_dip_spin.value()
         state.min_aperture_m = self.min_aperture_spin.value()
@@ -534,6 +594,11 @@ Recommendation:
     def refresh_from_state(self) -> None:
         """Refresh UI from loaded state."""
         state = self.controller.state.algorithm
+
+        # Refresh kernel type
+        kernel_type_map = {"straight_ray": 0, "curved_ray": 1, "anisotropic_vti": 2}
+        self.kernel_type.setCurrentIndex(kernel_type_map.get(state.kernel_type, 0))
+        self._on_kernel_type_changed(self.kernel_type.currentIndex())
 
         self.max_dip_spin.setValue(state.max_dip_degrees)
         self.min_aperture_spin.setValue(state.min_aperture_m)

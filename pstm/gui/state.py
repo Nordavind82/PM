@@ -112,6 +112,17 @@ class VelocityState:
     file_path: str = ""
     is_prepared: bool = False
 
+    # Curved ray gradient parameters (V(z) = V0 + k*z)
+    curved_ray_source: str = "from_velocity"  # from_velocity, manual
+    curved_ray_v0: float = 1500.0  # Surface velocity (m/s)
+    curved_ray_k: float = 0.5  # Velocity gradient (1/s)
+
+    # VTI anisotropy eta parameters
+    vti_eta_source: str = "constant"  # constant, table_1d, cube_3d
+    vti_eta_constant: float = 0.1  # Constant eta value
+    vti_eta_table: list[tuple[float, float]] = field(default_factory=list)  # [(time_ms, eta), ...]
+    vti_eta_cube_path: str = ""  # Path to 3D eta cube (Zarr format)
+
 
 @dataclass
 class OffsetRange:
@@ -131,19 +142,51 @@ class AzimuthSector:
 
 
 @dataclass
+class GatherBinState:
+    """
+    Unified gather bin definition for GUI state.
+
+    Supports both offset ranges and OVT tiles in a single list.
+    """
+    bin_type: str = "offset"  # "offset" or "ovt"
+    name: str = ""
+
+    # Offset fields (when bin_type == "offset")
+    offset_min: float | None = None
+    offset_max: float | None = None
+
+    # OVT fields (when bin_type == "ovt")
+    ovt_x_min: float | None = None
+    ovt_x_max: float | None = None
+    ovt_y_min: float | None = None
+    ovt_y_max: float | None = None
+
+    def get_display_name(self) -> str:
+        """Get human-readable display name."""
+        if self.name:
+            return self.name
+        if self.bin_type == "offset":
+            omin = self.offset_min if self.offset_min is not None else 0
+            omax = self.offset_max if self.offset_max is not None else "∞"
+            return f"Offset {omin}-{omax}m"
+        else:
+            return f"OVT X[{self.ovt_x_min},{self.ovt_x_max}] Y[{self.ovt_y_min},{self.ovt_y_max}]"
+
+
+@dataclass
 class DataSelectionState:
     """Data selection/filtering state - NO validation, user takes responsibility."""
     mode: str = "all"  # all, offset, azimuth, ovt, custom
-    
+
     # Offset mode
     offset_ranges: list[OffsetRange] = field(default_factory=list)
     offset_include_mode: bool = True
     include_negative_offsets: bool = True
-    
+
     # Azimuth mode
     azimuth_sectors: list[AzimuthSector] = field(default_factory=list)
     azimuth_convention: str = "receiver_relative"
-    
+
     # OVT mode - signed offset components
     offset_x_min: float | None = None
     offset_x_max: float | None = None
@@ -152,13 +195,69 @@ class DataSelectionState:
     ovt_tile_size_x: float = 500.0
     ovt_tile_size_y: float = 500.0
     ovt_selected_tiles: list[tuple[int, int]] = field(default_factory=list)
-    
+
+    # OVT vector-based tile definition (new feature)
+    ovt_use_vectors: bool = False
+    ovt_vector_x: str = ""  # Comma-separated: "-1000,-600,-200,200,600,1000"
+    ovt_vector_y: str = ""  # Comma-separated: "-1000,-600,-200,200,600,1000"
+
+    # Unified gather bins - supports mixed offset and OVT bins
+    gather_bins: list[GatherBinState] = field(default_factory=list)
+
+    # Output gathers - create separate migrated volumes per bin
+    output_gathers_enabled: bool = False
+
     # Custom expression mode
     custom_expression: str = ""
-    
+
     # Statistics
     total_traces: int = 0
     selected_traces: int = 0
+
+    def parse_ovt_vectors(self) -> tuple[list[float], list[float]]:
+        """Parse OVT vector strings into lists of floats.
+
+        Returns:
+            Tuple of (x_edges, y_edges) lists. Empty lists if not defined or parse error.
+        """
+        x_edges = []
+        y_edges = []
+
+        if self.ovt_vector_x:
+            try:
+                x_edges = [float(v.strip()) for v in self.ovt_vector_x.split(",") if v.strip()]
+                x_edges = sorted(x_edges)
+            except ValueError:
+                x_edges = []
+
+        if self.ovt_vector_y:
+            try:
+                y_edges = [float(v.strip()) for v in self.ovt_vector_y.split(",") if v.strip()]
+                y_edges = sorted(y_edges)
+            except ValueError:
+                y_edges = []
+
+        return x_edges, y_edges
+
+    def get_ovt_tiles_from_vectors(self) -> list[tuple[int, int, float, float, float, float]]:
+        """Generate OVT tile definitions from vectors.
+
+        Returns:
+            List of (tile_ix, tile_iy, x_min, x_max, y_min, y_max) tuples
+        """
+        x_edges, y_edges = self.parse_ovt_vectors()
+        if len(x_edges) < 2 or len(y_edges) < 2:
+            return []
+
+        tiles = []
+        for ix in range(len(x_edges) - 1):
+            for iy in range(len(y_edges) - 1):
+                tiles.append((
+                    ix, iy,
+                    x_edges[ix], x_edges[ix + 1],
+                    y_edges[iy], y_edges[iy + 1],
+                ))
+        return tiles
 
 
 @dataclass
@@ -192,6 +291,9 @@ class AlgorithmState:
     mute_above_ms: float = 0.0
     mute_below_ms: float = 10000.0
     time_variant: TimeVariantState = field(default_factory=TimeVariantState)
+
+    # Kernel type selection (parameters now in VelocityState)
+    kernel_type: str = "straight_ray"  # straight_ray, curved_ray, anisotropic_vti
 
 
 @dataclass
@@ -830,12 +932,13 @@ class WizardController:
                     return float(line_azimuth)
 
             # Method 3: PCA on midpoint distribution (fallback)
-            # Note: For 3D surveys, PCA often finds the crossline direction
-            # (maximum variance), so we may need to add 90 degrees
+            # The principal axis (max variance) indicates the direction of greatest
+            # data extent, which typically corresponds to the inline direction.
 
-            # Sample if too many points
+            # Sample if too many points (use fixed seed for reproducibility)
             if len(mx) > 50000:
-                indices = np.random.choice(len(mx), 50000, replace=False)
+                rng = np.random.default_rng(seed=42)
+                indices = rng.choice(len(mx), 50000, replace=False)
                 mx_sample = mx[indices]
                 my_sample = my[indices]
             else:
@@ -854,17 +957,34 @@ class WizardController:
             # Eigenvalue decomposition
             eigenvalues, eigenvectors = np.linalg.eigh(cov)
 
-            # For 3D surveys, the principal axis (max variance) is usually crossline
-            # We want the inline direction, which is the minor axis (perpendicular)
-            # Use the eigenvector with SMALLER eigenvalue for inline direction
-            minor_axis = eigenvectors[:, np.argmin(eigenvalues)]
-            azimuth = np.degrees(np.arctan2(minor_axis[0], minor_axis[1]))
+            # Check for degenerate case: eigenvalues are nearly equal
+            # This happens with square grids or isotropic data distributions
+            eigenvalue_ratio = max(eigenvalues) / min(eigenvalues) if min(eigenvalues) > 0 else 1.0
+            if eigenvalue_ratio < 1.2:
+                # Data has no clear directional preference (roughly square/isotropic)
+                # Default to 0° (grid aligned with coordinate axes)
+                return 0.0
 
-            # Normalize to 0-180 range
-            if azimuth < 0:
-                azimuth += 180
-            if azimuth >= 180:
-                azimuth -= 180
+            # Use the principal axis (max variance) for inline direction
+            # This is the direction of greatest data extent
+            principal_axis = eigenvectors[:, np.argmax(eigenvalues)]
+
+            # Compute azimuth using arctan2 and normalize to [0, 180) range
+            azimuth = np.degrees(np.arctan2(principal_axis[0], principal_axis[1]))
+            # Use modulo to handle the full range (-180, 180] -> [0, 180)
+            azimuth = azimuth % 180
+
+            # For nearly axis-aligned data, small noise can cause the angle to flip
+            # between near-0° and near-180° (which are equivalent for Y-axis alignment)
+            # or oscillate around 90° for X-axis alignment.
+            # Apply tolerance to round to nearest axis if very close.
+            axis_tolerance = 3.0  # degrees
+            if azimuth < axis_tolerance:
+                azimuth = 0.0
+            elif azimuth > 180 - axis_tolerance:
+                azimuth = 0.0  # 180° ≡ 0° for line orientation
+            elif abs(azimuth - 90) < axis_tolerance:
+                azimuth = 90.0
 
             return float(azimuth)
 
@@ -1034,9 +1154,122 @@ class WizardController:
         sel.total_traces = n
         sel.selected_traces = int(mask.sum())
         self.notify_change()
-        
+
         return mask
-    
+
+    def _get_midpoint_coordinates(self) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        """Get midpoint coordinates from headers, computing if necessary."""
+        if self._headers_df is None:
+            return None, None
+
+        try:
+            df = self._headers_df
+            inp = self.state.input_data
+
+            # Check if midpoint columns exist
+            mx_col = inp.col_midpoint_x
+            my_col = inp.col_midpoint_y
+
+            if mx_col in df.columns and my_col in df.columns:
+                mx = self._apply_coord_scalar(df[mx_col].values.astype(np.float64))
+                my = self._apply_coord_scalar(df[my_col].values.astype(np.float64))
+            else:
+                # Compute from source/receiver
+                sx = self._apply_coord_scalar(df[inp.col_source_x].values.astype(np.float64))
+                sy = self._apply_coord_scalar(df[inp.col_source_y].values.astype(np.float64))
+                rx = self._apply_coord_scalar(df[inp.col_receiver_x].values.astype(np.float64))
+                ry = self._apply_coord_scalar(df[inp.col_receiver_y].values.astype(np.float64))
+                mx = (sx + rx) / 2
+                my = (sy + ry) / 2
+
+            return mx, my
+
+        except Exception:
+            return None, None
+
+    def auto_calculate_bin_size(
+        self,
+        method: str = "histogram",
+    ) -> tuple[float, float, dict] | None:
+        """
+        Auto-calculate optimal bin size from midpoint distribution.
+
+        Args:
+            method: Algorithm - "histogram", "nearest_neighbor", "fft", or "ensemble"
+
+        Returns:
+            Tuple of (dx, dy, details_dict) or None if calculation fails
+        """
+        if self._headers_df is None:
+            return None
+
+        try:
+            from pstm.analysis.bin_size import (
+                auto_calculate_bin_size,
+                auto_calculate_bin_size_ensemble,
+                BinSizeMethod,
+            )
+
+            # Get midpoint coordinates
+            mx, my = self._get_midpoint_coordinates()
+            if mx is None or my is None:
+                return None
+
+            # Get azimuth if available
+            azimuth = self.compute_acquisition_azimuth() or 0.0
+
+            # Calculate bin size
+            if method == "ensemble":
+                result = auto_calculate_bin_size_ensemble(mx, my, azimuth)
+            else:
+                result = auto_calculate_bin_size(mx, my, BinSizeMethod(method), azimuth)
+
+            return result.dx, result.dy, result.to_dict()
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Bin size calculation failed: {e}")
+            return None
+
+    def analyze_grid_coverage(self) -> dict | None:
+        """
+        Analyze midpoint coverage relative to current output grid.
+
+        Returns:
+            Dictionary with coverage analysis results or None if analysis fails
+        """
+        if self._headers_df is None:
+            return None
+
+        try:
+            from pstm.analysis.grid_outliers import generate_outlier_report
+
+            # Get midpoint coordinates
+            mx, my = self._get_midpoint_coordinates()
+            if mx is None or my is None:
+                return None
+
+            # Get current grid corners
+            corners = self.state.output_grid.corners.as_array()
+
+            # Get algorithm parameters for aperture calculation
+            max_offset = self.state.survey.offset_max or 5000.0
+            max_dip = self.state.algorithm.max_dip_degrees
+
+            # Generate report
+            report = generate_outlier_report(
+                mx, my, corners,
+                max_offset_m=max_offset,
+                max_dip_deg=max_dip,
+            )
+
+            return report.to_dict()
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Grid coverage analysis failed: {e}")
+            return None
+
     def compute_fold_map(self, bin_size: float = 25.0) -> tuple[NDArray | None, str]:
         """Compute fold map from loaded headers.
         
@@ -1100,7 +1333,8 @@ class WizardController:
             CheckpointConfig, OutputProductsConfig, OutputFormat,
             ApertureConfig, AmplitudeConfig, InterpolationMethod,
             ExecutionConfig, ResourceConfig, ComputeBackend,
-            ColumnMapping, TimeVariantConfig,
+            ColumnMapping, TimeVariantConfig, MigrationKernelType,
+            CurvedRayConfig, AnisotropyVTIConfig,
         )
 
         state = self.state
@@ -1140,7 +1374,7 @@ class WizardController:
         else:
             velocity_config = VelocityConfig(
                 source=VelocitySource.CUBE_3D,
-                cube_path=vel.cube_path,
+                velocity_path=Path(vel.cube_path) if vel.cube_path else None,
             )
         
         algo = state.algorithm
@@ -1176,11 +1410,41 @@ class WizardController:
             max_downsample_factor=tv.max_downsample_factor,
         )
 
+        # Build kernel type config
+        kernel_type_map = {
+            "straight_ray": MigrationKernelType.STRAIGHT_RAY,
+            "curved_ray": MigrationKernelType.CURVED_RAY,
+            "anisotropic_vti": MigrationKernelType.ANISOTROPIC_VTI,
+        }
+        kernel_type = kernel_type_map.get(algo.kernel_type, MigrationKernelType.STRAIGHT_RAY)
+
+        # Build curved ray config (always create, set enabled based on kernel type)
+        # Parameters now come from VelocityState
+        curved_ray_config = CurvedRayConfig(
+            enabled=(algo.kernel_type == "curved_ray"),
+            gradient_source=vel.curved_ray_source,
+            v0_m_s=vel.curved_ray_v0,
+            k_per_s=vel.curved_ray_k,
+        )
+
+        # Build VTI anisotropy config (always create, set enabled based on kernel type)
+        # Parameters now come from VelocityState with 3D support
+        anisotropy_vti_config = AnisotropyVTIConfig(
+            enabled=(algo.kernel_type == "anisotropic_vti"),
+            eta_source=vel.vti_eta_source,
+            eta_constant=vel.vti_eta_constant,
+            eta_table=vel.vti_eta_table if vel.vti_eta_table else None,
+            eta_cube_path=vel.vti_eta_cube_path if vel.vti_eta_cube_path else None,
+        )
+
         algorithm_config = AlgorithmConfig(
             interpolation=interpolation,
             aperture=aperture_config,
             amplitude=amplitude_config,
             time_variant=time_variant_config,
+            kernel_type=kernel_type,
+            curved_ray=curved_ray_config,
+            anisotropy_vti=anisotropy_vti_config,
         )
         
         # Validate required fields - fail fast, no fallbacks
@@ -1191,26 +1455,54 @@ class WizardController:
         if not state.output.output_dir:
             raise ValueError("Output directory is required")
 
-        # Build output products config
-        # Check if offset ranges are defined in data selection - these become output gather bins
-        gather_offset_ranges = None
-        output_gathers = False
-        if state.data_selection.mode == "offset" and state.data_selection.offset_ranges:
-            ranges = [
-                (r.min_offset or 0.0, r.max_offset or 1e9)
-                for r in state.data_selection.offset_ranges
-                if r.min_offset is not None or r.max_offset is not None
-            ]
-            if ranges:
-                gather_offset_ranges = ranges
-                output_gathers = True
+        # Build output products config with unified gather bins
+        from pstm.config.models import GatherBin, GatherBinType
+        ds = state.data_selection
+        gather_bins_config: list[GatherBin] = []
+
+        # Priority 1: Use unified gather_bins list if populated
+        if ds.gather_bins:
+            for gb_state in ds.gather_bins:
+                if gb_state.bin_type == "offset":
+                    gather_bins_config.append(GatherBin.offset_bin(
+                        offset_min=gb_state.offset_min or 0.0,
+                        offset_max=gb_state.offset_max or 1e9,
+                        name=gb_state.name if gb_state.name else None,
+                    ))
+                else:  # "ovt"
+                    gather_bins_config.append(GatherBin.ovt_bin(
+                        x_min=gb_state.ovt_x_min or -1e9,
+                        x_max=gb_state.ovt_x_max or 1e9,
+                        y_min=gb_state.ovt_y_min or -1e9,
+                        y_max=gb_state.ovt_y_max or 1e9,
+                        name=gb_state.name if gb_state.name else None,
+                    ))
+            debug_logger.info(f"BUILD_CONFIG: Using unified gather_bins, {len(gather_bins_config)} bins")
+
+        # Legacy: offset ranges from offset mode
+        elif ds.mode == "offset" and ds.offset_ranges and ds.output_gathers_enabled:
+            for r in ds.offset_ranges:
+                if r.min_offset is not None or r.max_offset is not None:
+                    gather_bins_config.append(GatherBin.offset_bin(
+                        offset_min=r.min_offset or 0.0,
+                        offset_max=r.max_offset or 1e9,
+                    ))
+            debug_logger.info(f"BUILD_CONFIG: Legacy offset ranges -> {len(gather_bins_config)} bins")
+
+        # Legacy: OVT tiles from ovt mode
+        elif ds.mode == "ovt" and ds.output_gathers_enabled:
+            if ds.ovt_use_vectors and ds.ovt_vector_x and ds.ovt_vector_y:
+                tiles = ds.get_ovt_tiles_from_vectors()
+                for ix, iy, x_min, x_max, y_min, y_max in tiles:
+                    gather_bins_config.append(GatherBin.ovt_bin(x_min, x_max, y_min, y_max))
+                debug_logger.info(f"BUILD_CONFIG: Legacy OVT vectors -> {len(gather_bins_config)} bins")
 
         products = OutputProductsConfig(
             stacked_image=state.output.output_stacked_image,
             fold_volume=state.output.output_fold_map,
             common_image_gathers=state.output.output_cig,
-            output_gathers=output_gathers,
-            gather_offset_ranges=gather_offset_ranges,
+            gather_bins=gather_bins_config if gather_bins_config else None,
+            output_gathers=len(gather_bins_config) > 0,
         )
 
         # Determine output format
@@ -1290,18 +1582,60 @@ class WizardController:
             )
             debug_logger.info(f"BUILD_CONFIG: data_selection mode=offset, ranges={config_ranges}")
         elif ds.mode == "ovt":
-            data_selection_config = DataSelectionConfig(
-                mode=SelectionMode.OFFSET_VECTOR,
-                offset_vector_selector=OffsetVectorSelector(
-                    offset_x_min=ds.offset_x_min,
-                    offset_x_max=ds.offset_x_max,
-                    offset_y_min=ds.offset_y_min,
-                    offset_y_max=ds.offset_y_max,
-                    tile_size_x=ds.ovt_tile_size_x,
-                    tile_size_y=ds.ovt_tile_size_y,
-                ),
-            )
-            debug_logger.info(f"BUILD_CONFIG: data_selection mode=ovt")
+            # Check if using vector-based tile definition
+            if ds.ovt_use_vectors and ds.ovt_vector_x and ds.ovt_vector_y:
+                # Parse vectors and generate tiles
+                x_edges, y_edges = ds.parse_ovt_vectors()
+                if x_edges and y_edges:
+                    # Generate all tile indices
+                    selected_tiles = [
+                        (ix, iy)
+                        for ix in range(len(x_edges) - 1)
+                        for iy in range(len(y_edges) - 1)
+                    ]
+                    data_selection_config = DataSelectionConfig(
+                        mode=SelectionMode.OFFSET_VECTOR,
+                        offset_vector_selector=OffsetVectorSelector(
+                            use_vector_tiles=True,
+                            use_tiles=True,
+                            vector_x_edges=x_edges,
+                            vector_y_edges=y_edges,
+                            selected_tiles=selected_tiles,
+                            offset_x_min=min(x_edges),
+                            offset_x_max=max(x_edges),
+                            offset_y_min=min(y_edges),
+                            offset_y_max=max(y_edges),
+                        ),
+                    )
+                    debug_logger.info(f"BUILD_CONFIG: data_selection mode=ovt vector, x_edges={x_edges}, y_edges={y_edges}, tiles={len(selected_tiles)}")
+                else:
+                    # Fallback to range mode if vectors couldn't be parsed
+                    data_selection_config = DataSelectionConfig(
+                        mode=SelectionMode.OFFSET_VECTOR,
+                        offset_vector_selector=OffsetVectorSelector(
+                            offset_x_min=ds.offset_x_min,
+                            offset_x_max=ds.offset_x_max,
+                            offset_y_min=ds.offset_y_min,
+                            offset_y_max=ds.offset_y_max,
+                            tile_size_x=ds.ovt_tile_size_x,
+                            tile_size_y=ds.ovt_tile_size_y,
+                        ),
+                    )
+                    debug_logger.info(f"BUILD_CONFIG: data_selection mode=ovt range (vector parse failed)")
+            else:
+                # Range-based OVT mode
+                data_selection_config = DataSelectionConfig(
+                    mode=SelectionMode.OFFSET_VECTOR,
+                    offset_vector_selector=OffsetVectorSelector(
+                        offset_x_min=ds.offset_x_min,
+                        offset_x_max=ds.offset_x_max,
+                        offset_y_min=ds.offset_y_min,
+                        offset_y_max=ds.offset_y_max,
+                        tile_size_x=ds.ovt_tile_size_x,
+                        tile_size_y=ds.ovt_tile_size_y,
+                    ),
+                )
+                debug_logger.info(f"BUILD_CONFIG: data_selection mode=ovt range")
         elif ds.mode == "custom" and ds.custom_expression:
             data_selection_config = DataSelectionConfig(
                 mode=SelectionMode.CUSTOM,

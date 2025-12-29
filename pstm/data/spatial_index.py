@@ -102,6 +102,20 @@ class SpatialIndex:
         return instance
 
     @property
+    def midpoint_x(self) -> NDArray[np.float64]:
+        """Get midpoint X coordinates."""
+        if self._coordinates is None:
+            return np.array([], dtype=np.float64)
+        return self._coordinates[:, 0]
+
+    @property
+    def midpoint_y(self) -> NDArray[np.float64]:
+        """Get midpoint Y coordinates."""
+        if self._coordinates is None:
+            return np.array([], dtype=np.float64)
+        return self._coordinates[:, 1]
+
+    @property
     def info(self) -> SpatialIndexInfo | None:
         """Get index information."""
         return self._info

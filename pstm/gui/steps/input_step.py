@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
+    QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QCheckBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -146,6 +146,16 @@ class InputDataStep(WizardStepWidget):
         load_row.addWidget(self.load_btn)
         load_row.addStretch()
         dataset_layout.addLayout(load_row)
+
+        # Coordinate scalar option
+        self.apply_scalar_checkbox = QCheckBox("Apply coordinate scalar (SEG-Y SCALCO)")
+        self.apply_scalar_checkbox.setChecked(True)
+        self.apply_scalar_checkbox.setToolTip(
+            "If enabled, applies SEG-Y coordinate scalar from headers.\n"
+            "Disable for synthetic data or data without SCALCO column."
+        )
+        self.apply_scalar_checkbox.toggled.connect(self._on_scalar_checkbox_changed)
+        dataset_layout.addWidget(self.apply_scalar_checkbox)
 
         self.content_layout.addWidget(dataset_frame)
 
@@ -413,6 +423,21 @@ class InputDataStep(WizardStepWidget):
         self._save_mappings_to_state()
         self._update_validation()
 
+    def _on_scalar_checkbox_changed(self, checked: bool) -> None:
+        """Handle coordinate scalar checkbox change."""
+        self.controller.state.input_data.apply_coord_scalar = checked
+        # Update info label to reflect the change
+        state = self.controller.state.input_data
+        if state.is_loaded:
+            scalar_info = ""
+            if state.coord_scalar_value != 1 and checked:
+                scalar_info = f" (scalar {state.coord_scalar_value} will be applied)"
+            elif state.coord_scalar_value != 1 and not checked:
+                scalar_info = f" (scalar {state.coord_scalar_value} detected but DISABLED)"
+            self.info_label.setText(
+                f"✓ Loaded {state.n_traces:,} traces × {state.n_samples} samples{scalar_info}"
+            )
+
     def _save_mappings_to_state(self) -> None:
         """Save current mappings to state."""
         state = self.controller.state.input_data
@@ -466,6 +491,9 @@ class InputDataStep(WizardStepWidget):
         if state.dataset_path:
             self.dataset_path.setText(state.dataset_path)
             self._preview_dataset(state.dataset_path)
+
+        # Restore scalar checkbox state
+        self.apply_scalar_checkbox.setChecked(state.apply_coord_scalar)
 
         # If data is already loaded, populate combos
         if state.is_loaded and self.controller.headers_df is not None:

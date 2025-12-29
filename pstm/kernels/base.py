@@ -122,9 +122,12 @@ class OutputTile:
 
     image: NDArray[np.float64]  # (nx, ny, nt)
     fold: NDArray[np.int32]  # (nx, ny)
-    x_axis: NDArray[np.float64]
-    y_axis: NDArray[np.float64]
+    x_axis: NDArray[np.float64]  # 1D inline coordinates
+    y_axis: NDArray[np.float64]  # 1D crossline coordinates
     t_axis_ms: NDArray[np.float64]
+    # Optional 2D coordinate grids for rotated grids
+    x_grid: NDArray[np.float64] | None = None  # (nx, ny) X coordinates
+    y_grid: NDArray[np.float64] | None = None  # (nx, ny) Y coordinates
 
     @property
     def nx(self) -> int:
@@ -214,6 +217,20 @@ class KernelConfig:
     # Time-variant sampling
     time_variant_enabled: bool = False
     time_variant_windows: list | None = None  # List of TimeWindow objects
+
+    # Migration kernel type selection
+    kernel_type: str = "straight_ray"  # "straight_ray", "curved_ray", "anisotropic_vti"
+
+    # Curved ray parameters (V(z) = V0 + k*z linear gradient model)
+    curved_ray_enabled: bool = False
+    curved_ray_v0: float = 1500.0  # Surface velocity (m/s)
+    curved_ray_k: float = 0.5  # Velocity gradient (1/s), typically 0.3-0.6
+
+    # VTI anisotropy parameters (Alkhalifah-Tsvankin eta formulation)
+    vti_enabled: bool = False
+    vti_eta_constant: float = 0.0  # Constant eta value (used if eta_array is None)
+    vti_eta_array: NDArray[np.float64] | None = None  # 1D eta(t) or 3D eta(x,y,t)
+    vti_eta_is_1d: bool = True  # True if eta_array is 1D, False if 3D
     
     def __post_init__(self):
         """Apply defaults from settings."""

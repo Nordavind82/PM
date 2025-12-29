@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGroupBox, QFormLayout, QDoubleSpinBox, QFrame, QRadioButton,
     QButtonGroup, QFileDialog, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QSplitter, QStackedWidget,
+    QHeaderView, QSplitter, QStackedWidget, QComboBox,
 )
 from PyQt6.QtCore import Qt
 
@@ -68,10 +68,11 @@ class VelocityStep(WizardStepWidget):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(10, 0, 0, 0)
-        
+
         self._create_preview_section(right_layout)
         self._create_qc_section(right_layout)
-        
+        self._create_advanced_models_section(right_layout)
+
         splitter.addWidget(right_widget)
         splitter.setSizes([450, 550])
         
@@ -329,17 +330,264 @@ class VelocityStep(WizardStepWidget):
         """Create velocity QC section."""
         group = QGroupBox("Velocity QC")
         layout = QVBoxLayout(group)
-        
+
         self.qc_frame = QFrame()
         qc_layout = QVBoxLayout(self.qc_frame)
-        
+
         self.qc_label = QLabel("Run 'Prepare Velocity' to see QC results")
         qc_layout.addWidget(self.qc_label)
-        
+
         layout.addWidget(self.qc_frame)
-        
+
         parent_layout.addWidget(group)
-    
+
+    def _create_advanced_models_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create advanced velocity models section (curved ray, VTI eta)."""
+        # Curved Ray Gradient Section
+        self.curved_ray_group = QGroupBox("Curved Ray Gradient (for Curved Ray kernel)")
+        cr_layout = QFormLayout(self.curved_ray_group)
+
+        # Source selection
+        self.cr_source_combo = QComboBox()
+        self.cr_source_combo.addItems(["Estimate from Velocity", "Manual Entry"])
+        self.cr_source_combo.currentIndexChanged.connect(self._on_cr_source_changed)
+        cr_layout.addRow("Gradient Source:", self.cr_source_combo)
+
+        # Manual parameters
+        self.cr_v0_spin = QDoubleSpinBox()
+        self.cr_v0_spin.setRange(500, 6000)
+        self.cr_v0_spin.setValue(1500)
+        self.cr_v0_spin.setSuffix(" m/s")
+        self.cr_v0_spin.setToolTip("Surface velocity V₀ in V(z) = V₀ + k·z")
+        cr_layout.addRow("Surface Velocity V₀:", self.cr_v0_spin)
+
+        self.cr_k_spin = QDoubleSpinBox()
+        self.cr_k_spin.setRange(0.0, 2.0)
+        self.cr_k_spin.setDecimals(3)
+        self.cr_k_spin.setValue(0.5)
+        self.cr_k_spin.setSuffix(" 1/s")
+        self.cr_k_spin.setToolTip("Velocity gradient k (typical 0.3-0.6 1/s)")
+        cr_layout.addRow("Gradient k:", self.cr_k_spin)
+
+        # Estimate button
+        self.cr_estimate_btn = QPushButton("Estimate from Current Velocity")
+        self.cr_estimate_btn.clicked.connect(self._estimate_gradient)
+        cr_layout.addRow("", self.cr_estimate_btn)
+
+        # Info label
+        self.cr_info_label = QLabel("V(z=2000m) = ? m/s")
+        self.cr_info_label.setStyleSheet("color: #888888; font-size: 11px;")
+        cr_layout.addRow("Example:", self.cr_info_label)
+
+        parent_layout.addWidget(self.curved_ray_group)
+
+        # VTI Eta Section
+        self.vti_group = QGroupBox("VTI Anisotropy Eta (for Anisotropic VTI kernel)")
+        vti_layout = QFormLayout(self.vti_group)
+
+        # Eta source selection
+        self.vti_source_combo = QComboBox()
+        self.vti_source_combo.addItems(["Constant Value", "1D Table η(t)", "3D Cube η(x,y,t)"])
+        self.vti_source_combo.currentIndexChanged.connect(self._on_vti_source_changed)
+        vti_layout.addRow("Eta Source:", self.vti_source_combo)
+
+        # Constant eta
+        self.vti_eta_spin = QDoubleSpinBox()
+        self.vti_eta_spin.setRange(-0.3, 0.5)
+        self.vti_eta_spin.setDecimals(3)
+        self.vti_eta_spin.setValue(0.1)
+        self.vti_eta_spin.setToolTip("Anisotropy parameter η = (ε-δ)/(1+2δ), typical 0.05-0.20")
+        vti_layout.addRow("Eta (η) Constant:", self.vti_eta_spin)
+
+        # 1D Table
+        self.vti_table_btn = QPushButton("Edit η(t) Table...")
+        self.vti_table_btn.clicked.connect(self._edit_eta_table)
+        self.vti_table_btn.setEnabled(False)
+        vti_layout.addRow("1D Table:", self.vti_table_btn)
+
+        # 3D Cube path
+        cube_row = QHBoxLayout()
+        self.vti_cube_path = QLineEdit()
+        self.vti_cube_path.setPlaceholderText("Select 3D eta cube...")
+        self.vti_cube_path.setEnabled(False)
+        cube_row.addWidget(self.vti_cube_path)
+        self.vti_cube_browse_btn = QPushButton("Browse...")
+        self.vti_cube_browse_btn.clicked.connect(self._browse_eta_cube)
+        self.vti_cube_browse_btn.setEnabled(False)
+        cube_row.addWidget(self.vti_cube_browse_btn)
+        vti_layout.addRow("3D Cube:", cube_row)
+
+        # Info label
+        vti_info = QLabel(
+            "η ≈ 0: isotropic | η = 0.05-0.15: typical shale | η > 0.20: strong anisotropy"
+        )
+        vti_info.setStyleSheet("color: #888888; font-size: 11px;")
+        vti_info.setWordWrap(True)
+        vti_layout.addRow("", vti_info)
+
+        parent_layout.addWidget(self.vti_group)
+
+        # Initially update visibility based on current state
+        self._update_cr_info()
+
+    def _on_cr_source_changed(self, index: int) -> None:
+        """Handle curved ray source change."""
+        is_manual = (index == 1)
+        self.cr_v0_spin.setEnabled(is_manual)
+        self.cr_k_spin.setEnabled(is_manual)
+        self.cr_estimate_btn.setEnabled(index == 0)
+
+    def _on_vti_source_changed(self, index: int) -> None:
+        """Handle VTI eta source change."""
+        self.vti_eta_spin.setEnabled(index == 0)  # Constant
+        self.vti_table_btn.setEnabled(index == 1)  # 1D Table
+        self.vti_cube_path.setEnabled(index == 2)  # 3D Cube
+        self.vti_cube_browse_btn.setEnabled(index == 2)
+
+    def _estimate_gradient(self) -> None:
+        """Estimate V0 and k from current velocity model."""
+        from PyQt6.QtWidgets import QMessageBox
+        try:
+            import numpy as np
+            from pstm.algorithm.curved_ray import estimate_gradient_from_vrms
+
+            # Get velocity from current settings
+            source_idx = self.source_group.checkedId()
+
+            if source_idx == 0:  # Constant
+                QMessageBox.warning(
+                    self, "Cannot Estimate",
+                    "Cannot estimate gradient from constant velocity.\n"
+                    "Use Linear or 1D Function velocity source."
+                )
+                return
+
+            # Build velocity array
+            grid = self.controller.state.output_grid
+            t_ms = np.linspace(grid.t_min_ms, grid.t_max_ms, 100)
+
+            if source_idx == 1:  # Linear
+                v0 = self.linear_v0_spin.value()
+                k = self.linear_grad_spin.value()
+                vrms = v0 + k * t_ms
+            elif source_idx == 2:  # 1D Function
+                t_vals, v_vals = [], []
+                for row in range(self.func_table.rowCount()):
+                    t_item = self.func_table.item(row, 0)
+                    v_item = self.func_table.item(row, 1)
+                    if t_item and v_item:
+                        try:
+                            t_vals.append(float(t_item.text()))
+                            v_vals.append(float(v_item.text()))
+                        except ValueError:
+                            pass
+                if len(t_vals) < 2:
+                    QMessageBox.warning(self, "Error", "Need at least 2 velocity points.")
+                    return
+                vrms = np.interp(t_ms, t_vals, v_vals)
+            else:
+                QMessageBox.warning(self, "Error", "Select velocity source first.")
+                return
+
+            # Estimate gradient
+            v0_est, k_est = estimate_gradient_from_vrms(vrms, t_ms)
+
+            self.cr_v0_spin.setValue(v0_est)
+            self.cr_k_spin.setValue(k_est)
+            self._update_cr_info()
+
+            QMessageBox.information(
+                self, "Gradient Estimated",
+                f"Estimated from velocity:\n\n"
+                f"V₀ = {v0_est:.0f} m/s\n"
+                f"k = {k_est:.3f} 1/s\n\n"
+                f"V(z=2000m) = {v0_est + k_est * 2000:.0f} m/s"
+            )
+
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not estimate gradient: {e}")
+
+    def _update_cr_info(self) -> None:
+        """Update curved ray info label."""
+        v0 = self.cr_v0_spin.value()
+        k = self.cr_k_spin.value()
+        v_2000 = v0 + k * 2000
+        self.cr_info_label.setText(f"V(z=2000m) = {v_2000:.0f} m/s")
+
+    def _edit_eta_table(self) -> None:
+        """Open dialog to edit eta(t) table."""
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit η(t) Table")
+        dialog.resize(400, 300)
+
+        layout = QVBoxLayout(dialog)
+
+        # Table
+        table = QTableWidget(5, 2)
+        table.setHorizontalHeaderLabels(["Time (ms)", "Eta (η)"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        # Load existing values
+        eta_table = self.controller.state.velocity.vti_eta_table
+        if eta_table:
+            table.setRowCount(len(eta_table))
+            for row, (t, eta) in enumerate(eta_table):
+                table.setItem(row, 0, QTableWidgetItem(str(t)))
+                table.setItem(row, 1, QTableWidgetItem(str(eta)))
+        else:
+            # Default values
+            default_pairs = [(0, 0.05), (1000, 0.08), (2000, 0.12), (3000, 0.15), (4000, 0.18)]
+            for row, (t, eta) in enumerate(default_pairs):
+                table.setItem(row, 0, QTableWidgetItem(str(t)))
+                table.setItem(row, 1, QTableWidgetItem(str(eta)))
+
+        layout.addWidget(table)
+
+        # Add/Remove buttons
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add Row")
+        add_btn.clicked.connect(lambda: table.insertRow(table.rowCount()))
+        btn_layout.addWidget(add_btn)
+        remove_btn = QPushButton("Remove Row")
+        remove_btn.clicked.connect(lambda: table.removeRow(table.currentRow()))
+        btn_layout.addWidget(remove_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        # Dialog buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Save table values
+            eta_table = []
+            for row in range(table.rowCount()):
+                t_item = table.item(row, 0)
+                eta_item = table.item(row, 1)
+                if t_item and eta_item:
+                    try:
+                        t = float(t_item.text())
+                        eta = float(eta_item.text())
+                        eta_table.append((t, eta))
+                    except ValueError:
+                        pass
+            self.controller.state.velocity.vti_eta_table = eta_table
+
+    def _browse_eta_cube(self) -> None:
+        """Browse for 3D eta cube."""
+        path = QFileDialog.getExistingDirectory(
+            self, "Select 3D Eta Cube Directory"
+        )
+        if path:
+            self.vti_cube_path.setText(path)
+            self.controller.state.velocity.vti_eta_cube_path = path
+
     def _on_source_changed(self, button_id: int, checked: bool) -> None:
         """Handle velocity source change."""
         if checked:
@@ -516,6 +764,22 @@ class VelocityStep(WizardStepWidget):
         if cfg.file_path:
             self.file_path_edit.setText(cfg.file_path)
 
+        # Load curved ray parameters
+        cr_source_map = {"from_velocity": 0, "manual": 1}
+        self.cr_source_combo.setCurrentIndex(cr_source_map.get(cfg.curved_ray_source, 0))
+        self.cr_v0_spin.setValue(cfg.curved_ray_v0)
+        self.cr_k_spin.setValue(cfg.curved_ray_k)
+        self._on_cr_source_changed(self.cr_source_combo.currentIndex())
+        self._update_cr_info()
+
+        # Load VTI eta parameters
+        vti_source_map = {"constant": 0, "table_1d": 1, "cube_3d": 2}
+        self.vti_source_combo.setCurrentIndex(vti_source_map.get(cfg.vti_eta_source, 0))
+        self.vti_eta_spin.setValue(cfg.vti_eta_constant)
+        if cfg.vti_eta_cube_path:
+            self.vti_cube_path.setText(cfg.vti_eta_cube_path)
+        self._on_vti_source_changed(self.vti_source_combo.currentIndex())
+
         # Update grid info from output_grid state
         grid = self.controller.state.output_grid
         debug_logger.info(f"VELOCITY on_enter: grid corners c1=({grid.corners.c1_x}, {grid.corners.c1_y})")
@@ -535,7 +799,7 @@ class VelocityStep(WizardStepWidget):
     def save_to_model(self) -> None:
         """Save data to project model."""
         cfg = self.controller.state.velocity
-        
+
         # Save source type - use string values matching VelocityState
         source_idx = self.source_group.checkedId()
         source_map = {
@@ -545,14 +809,14 @@ class VelocityStep(WizardStepWidget):
             3: "cube_3d",
         }
         cfg.source = source_map.get(source_idx, "constant")
-        
+
         # Save parameters
         cfg.constant_velocity = self.const_velocity_spin.value()
         cfg.linear_v0 = self.linear_v0_spin.value()
         cfg.linear_gradient = self.linear_grad_spin.value()
         cfg.cube_path = self.cube_path_edit.text()
         cfg.file_path = self.file_path_edit.text()
-        
+
         # Save 1D function values
         if source_idx == 2:
             times = []
@@ -568,6 +832,18 @@ class VelocityStep(WizardStepWidget):
                         pass
             cfg.function_times_ms = times
             cfg.function_velocities = velocities
+
+        # Save curved ray parameters
+        cr_source_map = {0: "from_velocity", 1: "manual"}
+        cfg.curved_ray_source = cr_source_map.get(self.cr_source_combo.currentIndex(), "from_velocity")
+        cfg.curved_ray_v0 = self.cr_v0_spin.value()
+        cfg.curved_ray_k = self.cr_k_spin.value()
+
+        # Save VTI eta parameters
+        vti_source_map = {0: "constant", 1: "table_1d", 2: "cube_3d"}
+        cfg.vti_eta_source = vti_source_map.get(self.vti_source_combo.currentIndex(), "constant")
+        cfg.vti_eta_constant = self.vti_eta_spin.value()
+        cfg.vti_eta_cube_path = self.vti_cube_path.text()
     
     def validate(self) -> bool:
         """Validate step data."""

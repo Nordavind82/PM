@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import math
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pstm.analysis.bin_size import BinSizeResult
+    from pstm.analysis.grid_outliers import OutlierReport
 
 import numpy as np
 from pydantic import (
@@ -223,33 +227,129 @@ class CornerPoints(BaseModel):
     def contains_point(self, x: float, y: float) -> bool:
         """Check if a point is inside the grid (using cross-product method)."""
         corners = self.to_numpy()
-        
+
         def sign(p1, p2, p3):
             return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
-        
+
         p = np.array([x, y])
-        
+
         # Check if point is inside quadrilateral using triangulation
         # Split quad into two triangles and check both
         d1 = sign(p, corners[0], corners[1])
         d2 = sign(p, corners[1], corners[2])
         d3 = sign(p, corners[2], corners[0])
-        
+
         has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
         has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-        
+
         in_tri1 = not (has_neg and has_pos)
-        
+
         d1 = sign(p, corners[0], corners[2])
         d2 = sign(p, corners[2], corners[3])
         d3 = sign(p, corners[3], corners[0])
-        
+
         has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
         has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-        
+
         in_tri2 = not (has_neg and has_pos)
-        
+
         return in_tri1 or in_tri2
+
+    def classify_points(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        buffer_m: float = 0.0,
+    ) -> dict[str, Any]:
+        """
+        Classify points relative to grid boundary.
+
+        Uses the grid_outliers module for efficient batch classification.
+
+        Args:
+            x: X coordinates of points
+            y: Y coordinates of points
+            buffer_m: Optional buffer distance (positive = expand grid)
+
+        Returns:
+            Dictionary with:
+            - inside_mask: boolean array
+            - signed_distances: float array (negative = inside)
+            - n_inside, n_outside: counts
+            - inside_ratio: fraction inside
+            - suggested_buffer_m: buffer to include all points
+        """
+        from pstm.analysis.grid_outliers import classify_points_against_grid
+
+        corners = self.to_numpy()
+        result = classify_points_against_grid(x, y, corners, buffer_m)
+
+        return {
+            "inside_mask": result.inside_mask,
+            "signed_distances": result.signed_distances,
+            "nearest_edge": result.nearest_edge,
+            "n_inside": result.n_inside,
+            "n_outside": result.n_outside,
+            "inside_ratio": result.inside_ratio,
+            "max_distance_outside": result.max_distance_outside,
+            "mean_distance_outside": result.mean_distance_outside,
+            "outside_by_quadrant": result.outside_by_quadrant,
+            "suggested_buffer_m": result.suggested_buffer_m,
+        }
+
+    def extend_by_buffer(self, buffer_m: float) -> "CornerPoints":
+        """
+        Create new CornerPoints extended outward by buffer distance.
+
+        Each corner is moved outward along the diagonal from center.
+
+        Args:
+            buffer_m: Buffer distance in meters
+
+        Returns:
+            New CornerPoints instance with extended boundaries
+        """
+        from pstm.analysis.grid_outliers import compute_extended_corners
+
+        corners = self.to_numpy()
+        extended = compute_extended_corners(corners, buffer_m)
+
+        return CornerPoints.from_tuples(
+            c1=tuple(extended[0]),
+            c2=tuple(extended[1]),
+            c3=tuple(extended[2]),
+            c4=tuple(extended[3]),
+        )
+
+    def extend_by_aperture(
+        self,
+        max_offset_m: float,
+        max_dip_deg: float,
+    ) -> "CornerPoints":
+        """
+        Create new CornerPoints extended by migration aperture.
+
+        Traces within aperture distance outside grid can contribute
+        to output points near the edge.
+
+        Args:
+            max_offset_m: Maximum offset in meters
+            max_dip_deg: Maximum dip angle in degrees
+
+        Returns:
+            New CornerPoints instance with aperture-extended boundaries
+        """
+        from pstm.analysis.grid_outliers import compute_aperture_extended_corners
+
+        corners = self.to_numpy()
+        extended = compute_aperture_extended_corners(corners, max_offset_m, max_dip_deg)
+
+        return CornerPoints.from_tuples(
+            c1=tuple(extended[0]),
+            c2=tuple(extended[1]),
+            c3=tuple(extended[2]),
+            c4=tuple(extended[3]),
+        )
 
 
 # =============================================================================
@@ -553,3 +653,132 @@ class OutputGridConfig(BaseModel):
                 "C4": corners.corner4.to_tuple(),
             }
         }
+
+    def analyze_coverage(
+        self,
+        mx: np.ndarray,
+        my: np.ndarray,
+        max_offset_m: float = 5000.0,
+        max_dip_deg: float = 45.0,
+    ) -> "OutlierReport":
+        """
+        Analyze midpoint coverage relative to this output grid.
+
+        Args:
+            mx: Midpoint X coordinates
+            my: Midpoint Y coordinates
+            max_offset_m: Maximum offset for aperture calculation
+            max_dip_deg: Maximum dip for aperture calculation
+
+        Returns:
+            OutlierReport with classification and recommendations
+        """
+        from pstm.analysis.grid_outliers import generate_outlier_report
+
+        corners = self._get_corners()
+        return generate_outlier_report(
+            mx, my, corners.to_numpy(),
+            max_offset_m=max_offset_m,
+            max_dip_deg=max_dip_deg,
+        )
+
+    @classmethod
+    def auto_calculate_bin_size(
+        cls,
+        mx: np.ndarray,
+        my: np.ndarray,
+        method: str = "histogram",
+        azimuth_deg: float = 0.0,
+    ) -> "BinSizeResult":
+        """
+        Auto-calculate optimal bin size from midpoint distribution.
+
+        This is a convenience class method that wraps the bin_size module.
+
+        Args:
+            mx: Midpoint X coordinates
+            my: Midpoint Y coordinates
+            method: Algorithm - "histogram", "nearest_neighbor", "fft", or "ensemble"
+            azimuth_deg: Acquisition azimuth for rotation alignment
+
+        Returns:
+            BinSizeResult with recommended dx, dy and diagnostics
+        """
+        from pstm.analysis.bin_size import (
+            auto_calculate_bin_size,
+            auto_calculate_bin_size_ensemble,
+            BinSizeMethod,
+        )
+
+        if method == "ensemble":
+            return auto_calculate_bin_size_ensemble(mx, my, azimuth_deg)
+        else:
+            return auto_calculate_bin_size(mx, my, BinSizeMethod(method), azimuth_deg)
+
+    def with_auto_bin_size(
+        self,
+        mx: np.ndarray,
+        my: np.ndarray,
+        method: str = "histogram",
+    ) -> "OutputGridConfig":
+        """
+        Create a new OutputGridConfig with auto-calculated bin sizes.
+
+        Args:
+            mx: Midpoint X coordinates
+            my: Midpoint Y coordinates
+            method: Algorithm for bin size calculation
+
+        Returns:
+            New OutputGridConfig with updated dx, dy
+        """
+        result = self.auto_calculate_bin_size(
+            mx, my, method, self.rotation_degrees
+        )
+
+        # Create new config with updated bin sizes
+        return OutputGridConfig(
+            definition_method=self.definition_method,
+            corners=self.corners,
+            x_min=self.x_min,
+            x_max=self.x_max,
+            y_min=self.y_min,
+            y_max=self.y_max,
+            dx=result.dx,
+            dy=result.dy,
+            t_min_ms=self.t_min_ms,
+            t_max_ms=self.t_max_ms,
+            dt_ms=self.dt_ms,
+        )
+
+    def extend_for_migration(
+        self,
+        max_offset_m: float,
+        max_dip_deg: float,
+    ) -> "OutputGridConfig":
+        """
+        Create extended grid that includes migration aperture zone.
+
+        Traces within aperture distance outside the grid can contribute
+        energy to output points near edges. This creates a grid that
+        includes those zones for proper edge handling.
+
+        Args:
+            max_offset_m: Maximum offset in meters
+            max_dip_deg: Maximum dip angle in degrees
+
+        Returns:
+            New OutputGridConfig with extended boundaries
+        """
+        corners = self._get_corners()
+        extended_corners = corners.extend_by_aperture(max_offset_m, max_dip_deg)
+
+        return OutputGridConfig(
+            definition_method=GridDefinitionMethod.CORNER_POINTS,
+            corners=extended_corners,
+            dx=self.dx,
+            dy=self.dy,
+            t_min_ms=self.t_min_ms,
+            t_max_ms=self.t_max_ms,
+            dt_ms=self.dt_ms,
+        )

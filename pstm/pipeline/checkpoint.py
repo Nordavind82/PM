@@ -204,10 +204,13 @@ class CheckpointHandler:
         # Update timestamp
         self._state.updated_at = datetime.now().isoformat()
 
-        # Save state JSON
+        # Save state JSON (convert numpy types to native Python for JSON serialization)
         state_file = self.checkpoint_dir / self.STATE_FILE
+        state_dict = asdict(self._state)
+        # Convert completed_tiles list to native Python ints
+        state_dict["completed_tiles"] = [int(t) for t in state_dict["completed_tiles"]]
         with open(state_file, "w") as f:
-            json.dump(asdict(self._state), f, indent=2)
+            json.dump(state_dict, f, indent=2)
 
         # Save completed mask for fast loading
         completed_file = self.checkpoint_dir / self.COMPLETED_FILE

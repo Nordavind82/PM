@@ -259,14 +259,14 @@ class OutputGridStep(WizardStepWidget):
         """Create bin size input section."""
         group = QGroupBox("Output Bin Size")
         layout = QVBoxLayout(group)
-        
+
         info = QLabel("Note: Output bin size is INDEPENDENT of input data spacing")
         info.setObjectName("sectionDescription")
         layout.addWidget(info)
-        
+
         form = QFormLayout()
         form.setSpacing(10)
-        
+
         # Inline bin size
         self.dx_spin = QDoubleSpinBox()
         self.dx_spin.setRange(0.1, 1000)
@@ -275,7 +275,7 @@ class OutputGridStep(WizardStepWidget):
         self.dx_spin.setSuffix(" m")
         self.dx_spin.valueChanged.connect(self._on_grid_changed)
         form.addRow("Inline (X) Bin Size:", self.dx_spin)
-        
+
         # Crossline bin size
         self.dy_spin = QDoubleSpinBox()
         self.dy_spin.setRange(0.1, 1000)
@@ -284,7 +284,7 @@ class OutputGridStep(WizardStepWidget):
         self.dy_spin.setSuffix(" m")
         self.dy_spin.valueChanged.connect(self._on_grid_changed)
         form.addRow("Crossline (Y) Bin Size:", self.dy_spin)
-        
+
         # Time sample interval
         self.dt_spin = QDoubleSpinBox()
         self.dt_spin.setRange(0.1, 100)
@@ -293,21 +293,40 @@ class OutputGridStep(WizardStepWidget):
         self.dt_spin.setSuffix(" ms")
         self.dt_spin.valueChanged.connect(self._on_grid_changed)
         form.addRow("Time Sample Interval:", self.dt_spin)
-        
+
         layout.addLayout(form)
-        
+
+        # Auto-calculate and quick presets row
+        btn_layout = QHBoxLayout()
+
+        # Auto-calculate button
+        self.auto_bin_btn = QPushButton("Auto-Calculate")
+        self.auto_bin_btn.setToolTip(
+            "Automatically calculate optimal bin size from midpoint distribution"
+        )
+        self.auto_bin_btn.clicked.connect(self._auto_calculate_bin_size)
+        btn_layout.addWidget(self.auto_bin_btn)
+
+        # Auto-calc info label
+        self.bin_calc_info_label = QLabel("")
+        self.bin_calc_info_label.setStyleSheet("color: #888; font-size: 11px;")
+        btn_layout.addWidget(self.bin_calc_info_label)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
         # Quick presets
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(QLabel("Quick Presets:"))
-        
+
         for size in [12.5, 25, 50]:
             btn = QPushButton(f"{size}m × {size}m")
             btn.clicked.connect(lambda checked, s=size: self._set_bin_preset(s))
             preset_layout.addWidget(btn)
-        
+
         preset_layout.addStretch()
         layout.addLayout(preset_layout)
-        
+
         parent_layout.addWidget(group)
     
     def _create_time_section(self, parent_layout: QVBoxLayout) -> None:
@@ -371,29 +390,74 @@ class OutputGridStep(WizardStepWidget):
     def _create_stats_section(self, parent_layout: QVBoxLayout) -> None:
         """Create grid statistics section."""
         group = QGroupBox("Grid Statistics")
-        layout = QFormLayout(group)
-        
+        layout = QVBoxLayout(group)
+
+        form = QFormLayout()
+
         self.inline_extent_label = QLabel("--")
-        layout.addRow("Inline extent:", self.inline_extent_label)
-        
+        form.addRow("Inline extent:", self.inline_extent_label)
+
         self.crossline_extent_label = QLabel("--")
-        layout.addRow("Crossline extent:", self.crossline_extent_label)
-        
+        form.addRow("Crossline extent:", self.crossline_extent_label)
+
         self.time_extent_label = QLabel("--")
-        layout.addRow("Time extent:", self.time_extent_label)
-        
+        form.addRow("Time extent:", self.time_extent_label)
+
         self.rotation_label = QLabel("--")
-        layout.addRow("Grid rotation:", self.rotation_label)
-        
+        form.addRow("Grid rotation:", self.rotation_label)
+
         self.total_points_label = QLabel("--")
-        layout.addRow("Total grid points:", self.total_points_label)
-        
+        form.addRow("Total grid points:", self.total_points_label)
+
         self.estimated_size_label = QLabel("--")
-        layout.addRow("Estimated output size:", self.estimated_size_label)
-        
-        self.coverage_label = QLabel("--")
-        layout.addRow("Data coverage:", self.coverage_label)
-        
+        form.addRow("Estimated output size:", self.estimated_size_label)
+
+        layout.addLayout(form)
+
+        # Coverage analysis section
+        coverage_group = QGroupBox("Coverage Analysis")
+        coverage_layout = QVBoxLayout(coverage_group)
+
+        coverage_form = QFormLayout()
+
+        self.coverage_inside_label = QLabel("--")
+        coverage_form.addRow("Points inside grid:", self.coverage_inside_label)
+
+        self.coverage_outside_label = QLabel("--")
+        coverage_form.addRow("Points outside grid:", self.coverage_outside_label)
+
+        self.coverage_ratio_label = QLabel("--")
+        coverage_form.addRow("Coverage ratio:", self.coverage_ratio_label)
+
+        self.outlier_warning_label = QLabel("")
+        self.outlier_warning_label.setStyleSheet("color: #FFA500; font-weight: bold;")
+        self.outlier_warning_label.setWordWrap(True)
+        coverage_form.addRow("", self.outlier_warning_label)
+
+        coverage_layout.addLayout(coverage_form)
+
+        # Analyze coverage button
+        analyze_btn_layout = QHBoxLayout()
+        self.analyze_coverage_btn = QPushButton("Analyze Coverage")
+        self.analyze_coverage_btn.setToolTip(
+            "Analyze how many midpoints fall inside/outside the defined grid"
+        )
+        self.analyze_coverage_btn.clicked.connect(self._analyze_coverage)
+        analyze_btn_layout.addWidget(self.analyze_coverage_btn)
+
+        self.extend_grid_btn = QPushButton("Extend to Include All")
+        self.extend_grid_btn.setToolTip(
+            "Extend grid boundaries to include all data points"
+        )
+        self.extend_grid_btn.clicked.connect(self._extend_grid_to_include_all)
+        self.extend_grid_btn.setEnabled(False)
+        analyze_btn_layout.addWidget(self.extend_grid_btn)
+
+        analyze_btn_layout.addStretch()
+        coverage_layout.addLayout(analyze_btn_layout)
+
+        layout.addWidget(coverage_group)
+
         parent_layout.addWidget(group)
     
     def _on_method_changed(self, button_id: int, checked: bool) -> None:
@@ -527,6 +591,113 @@ class OutputGridStep(WizardStepWidget):
         """Set bin size preset."""
         self.dx_spin.setValue(size)
         self.dy_spin.setValue(size)
+
+    def _auto_calculate_bin_size(self) -> None:
+        """Auto-calculate optimal bin size from midpoint distribution."""
+        result = self.controller.auto_calculate_bin_size(method="ensemble")
+
+        if result is None:
+            self._show_warning(
+                "Could not calculate bin size. "
+                "Please ensure header data is loaded with valid coordinates."
+            )
+            return
+
+        dx, dy, details = result
+
+        # Update spinboxes
+        self.dx_spin.setValue(dx)
+        self.dy_spin.setValue(dy)
+
+        # Show info
+        confidence = details.get("confidence", 0) * 100
+        fold = details.get("fold_estimate", 0)
+        method = details.get("method", "unknown")
+
+        self.bin_calc_info_label.setText(
+            f"Detected: {dx:.1f}m × {dy:.1f}m (conf: {confidence:.0f}%, fold: {fold:.1f})"
+        )
+
+        # Show warnings if any
+        warnings = details.get("warnings", [])
+        if warnings:
+            self._show_warning("\n".join(warnings))
+
+        self._on_grid_changed()
+
+    def _analyze_coverage(self) -> None:
+        """Analyze midpoint coverage relative to current grid."""
+        result = self.controller.analyze_grid_coverage()
+
+        if result is None:
+            self._show_warning(
+                "Could not analyze coverage. "
+                "Please ensure header data and grid are properly configured."
+            )
+            return
+
+        classification = result.get("classification", {})
+
+        n_inside = classification.get("n_inside", 0)
+        n_outside = classification.get("n_outside", 0)
+        n_total = classification.get("n_total", 1)
+        inside_ratio = classification.get("inside_ratio", 1.0)
+        suggested_buffer = classification.get("suggested_buffer_m", 0)
+
+        # Update labels
+        self.coverage_inside_label.setText(f"{n_inside:,}")
+        self.coverage_outside_label.setText(f"{n_outside:,}")
+        self.coverage_ratio_label.setText(f"{inside_ratio*100:.1f}%")
+
+        # Store for extend button
+        self._last_coverage_result = result
+        self._suggested_buffer = suggested_buffer
+
+        # Show warning if significant outliers
+        if n_outside > 0 and inside_ratio < 0.99:
+            warning = result.get("recommendation_reason", "")
+            self.outlier_warning_label.setText(warning)
+            self.extend_grid_btn.setEnabled(True)
+        else:
+            self.outlier_warning_label.setText("")
+            self.extend_grid_btn.setEnabled(False)
+
+    def _extend_grid_to_include_all(self) -> None:
+        """Extend grid boundaries to include all data points."""
+        if not hasattr(self, "_suggested_buffer") or self._suggested_buffer <= 0:
+            return
+
+        buffer = self._suggested_buffer
+
+        # Get current corners
+        c1 = list(self.corner1.get_point())
+        c2 = list(self.corner2.get_point())
+        c3 = list(self.corner3.get_point())
+        c4 = list(self.corner4.get_point())
+
+        # Compute center
+        center_x = (c1[0] + c2[0] + c3[0] + c4[0]) / 4
+        center_y = (c1[1] + c2[1] + c3[1] + c4[1]) / 4
+
+        # Extend each corner outward from center
+        for corner, (cx, cy) in [(c1, c1), (c2, c2), (c3, c3), (c4, c4)]:
+            dx = corner[0] - center_x
+            dy = corner[1] - center_y
+            length = (dx**2 + dy**2) ** 0.5
+            if length > 0:
+                corner[0] += (dx / length) * buffer
+                corner[1] += (dy / length) * buffer
+
+        # Update corner widgets
+        self.corner1.set_point(c1[0], c1[1])
+        self.corner2.set_point(c2[0], c2[1])
+        self.corner3.set_point(c3[0], c3[1])
+        self.corner4.set_point(c4[0], c4[1])
+
+        self._on_grid_changed()
+
+        # Re-analyze to update display
+        self._analyze_coverage()
     
     def _on_grid_changed(self) -> None:
         """Handle grid parameter change."""
@@ -576,12 +747,6 @@ class OutputGridStep(WizardStepWidget):
         self.estimated_size_label.setText(
             f"{size_gb_f32:.2f} GB (float32) / {size_gb_f64:.2f} GB (float64)"
         )
-        
-        # Update coverage (if survey geometry available)
-        geom = self.controller.state.survey
-        if geom is not None and geom.x_max > geom.x_min:
-            # Simplified coverage check
-            self.coverage_label.setText("Check after full analysis")
     
     def _update_preview(self) -> None:
         """Update grid preview visualization."""

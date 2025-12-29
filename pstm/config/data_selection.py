@@ -299,17 +299,21 @@ class OffsetAzimuthSelector(BaseConfig):
 class OffsetVectorSelector(BaseConfig):
     """
     Select traces using signed offset components (OVT style).
-    
+
     In OVT (Offset Vector Tile) selection:
     - offset_x = Rx - Sx (positive = receiver East of source)
     - offset_y = Ry - Sy (positive = receiver North of source)
-    
+
     Signs change according to azimuth quadrant, allowing selection
     of specific source-receiver geometries.
-    
+
+    Supports two modes:
+    1. Continuous range: offset_x_min/max and offset_y_min/max
+    2. Vector-based tiles: Generate tiles from X/Y edge vectors
+
     NO VALIDATION - user takes full responsibility for parameters.
     """
-    
+
     # Offset_X range (signed)
     offset_x_min: float | None = Field(
         default=None,
@@ -319,7 +323,7 @@ class OffsetVectorSelector(BaseConfig):
         default=None,
         description="Maximum offset_x (meters). Positive = receiver East of source.",
     )
-    
+
     # Offset_Y range (signed)
     offset_y_min: float | None = Field(
         default=None,
@@ -329,7 +333,7 @@ class OffsetVectorSelector(BaseConfig):
         default=None,
         description="Maximum offset_y (meters). Positive = receiver North of source.",
     )
-    
+
     # OVT tile definition
     use_tiles: bool = Field(
         default=False,
@@ -346,6 +350,20 @@ class OffsetVectorSelector(BaseConfig):
     selected_tiles: list[tuple[int, int]] | None = Field(
         default=None,
         description="List of (tile_ix, tile_iy) indices to select. None = all tiles in range.",
+    )
+
+    # Vector-based tile definition (alternative to fixed tile_size)
+    use_vector_tiles: bool = Field(
+        default=False,
+        description="Use vector-based tile edges instead of uniform tile size.",
+    )
+    vector_x_edges: list[float] | None = Field(
+        default=None,
+        description="X offset edge values for tile boundaries (e.g., [-1000,-600,-200,200,600,1000]).",
+    )
+    vector_y_edges: list[float] | None = Field(
+        default=None,
+        description="Y offset edge values for tile boundaries (e.g., [-1000,-600,-200,200,600,1000]).",
     )
     
     # Quadrant selection (convenience shortcuts)
@@ -373,19 +391,19 @@ class OffsetVectorSelector(BaseConfig):
     ) -> np.ndarray:
         """
         Apply OVT selection and return boolean mask.
-        
+
         Args:
             offset_x: Array of signed X offset values (Rx - Sx)
             offset_y: Array of signed Y offset values (Ry - Sy)
-            
+
         Returns:
             Boolean mask (True = include trace)
         """
         n = len(offset_x)
-        
+
         # Start with all True
         mask = np.ones(n, dtype=bool)
-        
+
         # Apply continuous range filters
         if self.offset_x_min is not None:
             mask &= (offset_x >= self.offset_x_min)
@@ -395,12 +413,12 @@ class OffsetVectorSelector(BaseConfig):
             mask &= (offset_y >= self.offset_y_min)
         if self.offset_y_max is not None:
             mask &= (offset_y <= self.offset_y_max)
-        
+
         # Apply quadrant selection
         if not all([self.select_quadrant_1, self.select_quadrant_2,
                     self.select_quadrant_3, self.select_quadrant_4]):
             quadrant_mask = np.zeros(n, dtype=bool)
-            
+
             if self.select_quadrant_1:  # +X, +Y
                 quadrant_mask |= (offset_x >= 0) & (offset_y >= 0)
             if self.select_quadrant_2:  # -X, +Y
@@ -409,36 +427,183 @@ class OffsetVectorSelector(BaseConfig):
                 quadrant_mask |= (offset_x < 0) & (offset_y < 0)
             if self.select_quadrant_4:  # +X, -Y
                 quadrant_mask |= (offset_x >= 0) & (offset_y < 0)
-            
+
             mask &= quadrant_mask
-        
-        # Apply OVT tile selection
-        if self.use_tiles and self.selected_tiles:
+
+        # Apply vector-based tile selection (irregular grid)
+        if self.use_vector_tiles and self.vector_x_edges and self.vector_y_edges:
+            if self.selected_tiles:
+                # Use vector edges for irregular tile boundaries
+                tile_ix, tile_iy = self.get_vector_tile_indices(offset_x, offset_y)
+                tile_mask = np.zeros(n, dtype=bool)
+                for tix, tiy in self.selected_tiles:
+                    tile_mask |= (tile_ix == tix) & (tile_iy == tiy)
+                mask &= tile_mask
+        # Apply regular OVT tile selection
+        elif self.use_tiles and self.selected_tiles:
             tile_ix = np.floor(offset_x / self.tile_size_x).astype(int)
             tile_iy = np.floor(offset_y / self.tile_size_y).astype(int)
-            
+
             tile_mask = np.zeros(n, dtype=bool)
             for tix, tiy in self.selected_tiles:
                 tile_mask |= (tile_ix == tix) & (tile_iy == tiy)
-            
+
             mask &= tile_mask
-        
+
         return mask
-    
+
     def get_tile_indices(
         self,
         offset_x: np.ndarray,
         offset_y: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Compute tile indices for all traces.
-        
+        Compute tile indices for all traces (regular grid).
+
         Returns:
             (tile_ix, tile_iy) arrays of tile indices
         """
         tile_ix = np.floor(offset_x / self.tile_size_x).astype(int)
         tile_iy = np.floor(offset_y / self.tile_size_y).astype(int)
         return tile_ix, tile_iy
+
+    def get_vector_tile_indices(
+        self,
+        offset_x: np.ndarray,
+        offset_y: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute tile indices for vector-based (irregular) tile grid.
+
+        Uses vector_x_edges and vector_y_edges to define irregular tile boundaries.
+        Tile index is the bin number (0 to n_edges-2).
+
+        Returns:
+            (tile_ix, tile_iy) arrays of tile indices. Values are -1 for out-of-range.
+        """
+        if not self.vector_x_edges or not self.vector_y_edges:
+            raise ValueError("Vector edges not defined")
+
+        x_edges = np.array(sorted(self.vector_x_edges))
+        y_edges = np.array(sorted(self.vector_y_edges))
+
+        # np.searchsorted returns bin index (0 = below first edge, n = above last)
+        # Subtract 1 to get 0-based tile index, -1 for out of range
+        tile_ix = np.searchsorted(x_edges, offset_x, side='right') - 1
+        tile_iy = np.searchsorted(y_edges, offset_y, side='right') - 1
+
+        # Mark out-of-range as -1
+        tile_ix = np.where((tile_ix < 0) | (tile_ix >= len(x_edges) - 1), -1, tile_ix)
+        tile_iy = np.where((tile_iy < 0) | (tile_iy >= len(y_edges) - 1), -1, tile_iy)
+
+        return tile_ix, tile_iy
+
+    def generate_tiles_from_vectors(self) -> list[tuple[int, int, float, float, float, float]]:
+        """
+        Generate all tile definitions from vector edges.
+
+        Returns:
+            List of (tile_ix, tile_iy, x_min, x_max, y_min, y_max) tuples
+        """
+        if not self.vector_x_edges or not self.vector_y_edges:
+            return []
+
+        x_edges = sorted(self.vector_x_edges)
+        y_edges = sorted(self.vector_y_edges)
+
+        tiles = []
+        for ix in range(len(x_edges) - 1):
+            for iy in range(len(y_edges) - 1):
+                tiles.append((
+                    ix, iy,
+                    x_edges[ix], x_edges[ix + 1],
+                    y_edges[iy], y_edges[iy + 1],
+                ))
+        return tiles
+
+    def get_tile_info(self) -> list[dict]:
+        """
+        Get detailed tile information for display/export.
+
+        Returns:
+            List of dicts with tile_ix, tile_iy, x_min, x_max, y_min, y_max, center_x, center_y
+        """
+        if self.use_vector_tiles and self.vector_x_edges and self.vector_y_edges:
+            tiles = self.generate_tiles_from_vectors()
+            return [
+                {
+                    "tile_ix": t[0],
+                    "tile_iy": t[1],
+                    "x_min": t[2],
+                    "x_max": t[3],
+                    "y_min": t[4],
+                    "y_max": t[5],
+                    "center_x": (t[2] + t[3]) / 2,
+                    "center_y": (t[4] + t[5]) / 2,
+                }
+                for t in tiles
+            ]
+        elif self.selected_tiles:
+            return [
+                {
+                    "tile_ix": tix,
+                    "tile_iy": tiy,
+                    "x_min": tix * self.tile_size_x,
+                    "x_max": (tix + 1) * self.tile_size_x,
+                    "y_min": tiy * self.tile_size_y,
+                    "y_max": (tiy + 1) * self.tile_size_y,
+                    "center_x": (tix + 0.5) * self.tile_size_x,
+                    "center_y": (tiy + 0.5) * self.tile_size_y,
+                }
+                for tix, tiy in self.selected_tiles
+            ]
+        return []
+
+    @classmethod
+    def from_vectors(
+        cls,
+        x_vector: list[float],
+        y_vector: list[float],
+        select_all: bool = True,
+    ) -> "OffsetVectorSelector":
+        """
+        Create OVT selector from X and Y offset vectors.
+
+        Vectors define tile edges. For example:
+            x_vector = [-1000, -600, -200, 200, 600, 1000]
+        Creates 5 tiles in X direction: [-1000,-600], [-600,-200], [-200,200], [200,600], [600,1000]
+
+        Args:
+            x_vector: Sorted list of X offset edge values
+            y_vector: Sorted list of Y offset edge values
+            select_all: If True, select all tiles; if False, selected_tiles must be set manually
+
+        Returns:
+            Configured OffsetVectorSelector
+        """
+        x_edges = sorted(x_vector)
+        y_edges = sorted(y_vector)
+
+        # Generate all tile indices if select_all
+        selected = None
+        if select_all:
+            selected = [
+                (ix, iy)
+                for ix in range(len(x_edges) - 1)
+                for iy in range(len(y_edges) - 1)
+            ]
+
+        return cls(
+            use_vector_tiles=True,
+            use_tiles=True,
+            vector_x_edges=x_edges,
+            vector_y_edges=y_edges,
+            selected_tiles=selected,
+            offset_x_min=min(x_edges),
+            offset_x_max=max(x_edges),
+            offset_y_min=min(y_edges),
+            offset_y_max=max(y_edges),
+        )
 
 
 # =============================================================================
