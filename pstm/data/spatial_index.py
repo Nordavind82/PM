@@ -229,6 +229,61 @@ class SpatialIndex:
 
         return self._trace_indices[candidate_idx][mask]
 
+    def count_in_rectangle(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        padding: float = 0.0,
+    ) -> int:
+        """
+        Count traces within a rectangle without allocating result array.
+
+        Faster than query_rectangle() when only the count is needed.
+        Used for V2 tile planning to estimate traces per tile.
+
+        Args:
+            x_min: Rectangle minimum X
+            x_max: Rectangle maximum X
+            y_min: Rectangle minimum Y
+            y_max: Rectangle maximum Y
+            padding: Extra padding around rectangle
+
+        Returns:
+            Number of traces within rectangle
+        """
+        if self._tree is None or self._coordinates is None:
+            raise RuntimeError("Spatial index not built")
+
+        # Apply padding
+        x_min -= padding
+        x_max += padding
+        y_min -= padding
+        y_max += padding
+
+        # Query using bounding circle
+        center_x = (x_min + x_max) / 2
+        center_y = (y_min + y_max) / 2
+        radius = np.sqrt((x_max - x_min) ** 2 + (y_max - y_min) ** 2) / 2
+
+        point = np.array([center_x, center_y])
+        candidate_idx = self._tree.query_ball_point(point, radius)
+
+        if len(candidate_idx) == 0:
+            return 0
+
+        # Exact filtering - count only
+        coords = self._coordinates[candidate_idx]
+        mask = (
+            (coords[:, 0] >= x_min)
+            & (coords[:, 0] <= x_max)
+            & (coords[:, 1] >= y_min)
+            & (coords[:, 1] <= y_max)
+        )
+
+        return int(np.sum(mask))
+
     def query_nearest(
         self,
         x: float,

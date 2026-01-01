@@ -1,0 +1,96 @@
+{
+  "shape": [
+    511,
+    427,
+    1001
+  ],
+  "data_type": "float32",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        64,
+        64,
+        1001
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0.0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {
+    "description": "PSTM Stacked Volume",
+    "created": "2025-12-29T16:16:24.380061",
+    "nx": 511,
+    "ny": 427,
+    "nt": 1001,
+    "dx": 25.0,
+    "dy": 12.5,
+    "dt_ms": 2.0,
+    "t_min_ms": 0.0,
+    "t_max_ms": 2000.0,
+    "n_bins_stacked": 17,
+    "offset_min": 200.0,
+    "offset_max": 1100.0,
+    "bins_used": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20
+    ],
+    "offsets_used": [
+      226.3051426861063,
+      277.9702007818951,
+      328.6659170867235,
+      376.87319304475324,
+      426.2079577120279,
+      476.32993322388796,
+      525.8484283525326,
+      576.0678397868891,
+      626.0542498261958,
+      676.1729020114242,
+      726.6432251334749,
+      775.7978908685925,
+      825.4248189993771,
+      875.7037331409829,
+      926.5013241237914,
+      975.8010804845522,
+      1024.1185191548786
+    ]
+  },
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}

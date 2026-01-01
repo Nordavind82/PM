@@ -18,8 +18,11 @@ Usage:
 import argparse
 import gc
 import logging
+import multiprocessing
+import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -53,17 +56,19 @@ from pstm.config.models import (
     ColumnMapping,
 )
 from pstm.pipeline.executor import run_migration, ProgressInfo
+from pstm.data.velocity_model import validate_velocity_coverage, VelocityCoverageReport
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 # Input data paths
-COMMON_OFFSET_DIR = Path("/Users/olegadamovich/SeismicData/common_offset_gathers_new")
-VELOCITY_PATH = Path("/Users/olegadamovich/SeismicData/PSTM_common_offset/velocity_pstm.zarr")
+COMMON_OFFSET_DIR = Path("/Users/olegadamovich/SeismicData/common_offset_20m")
+# Use the IL/XL-based velocity cube (proper grid alignment)
+VELOCITY_PATH = Path("/Users/olegadamovich/SeismicData/common_offset_20m/velocity_pstm.zarr")
 
-# Output directory - external disk for large migration output
-OUTPUT_DIR = Path("/Volumes/AO_DISK/PSTM_common_offset")
+# Output directory - local disk for migration output
+OUTPUT_DIR = Path("/Users/olegadamovich/SeismicData/PSTM_common_offset_20m")
 
 # Grid parameters (must match original migration)
 DX = 25.0   # Inline bin size (m)
@@ -85,9 +90,9 @@ MAX_APERTURE_M = 2000.0
 MIN_APERTURE_M = 500.0
 MAX_DIP_DEGREES = 65.0
 
-# Tile size
-TILE_NX = 512
-TILE_NY = 512
+# Tile size - optimized for M4 Max (10.5% faster than 512x512)
+TILE_NX = 128
+TILE_NY = 128
 
 # Time-variant sampling (disabled for CIG quality)
 TIME_VARIANT_ENABLED = False
@@ -101,6 +106,9 @@ TIME_VARIANT_TABLE = [
 
 # Minimum traces per bin to process
 MIN_TRACES_DEFAULT = 100
+
+# Default parallel workers (conservative for GPU memory)
+DEFAULT_PARALLEL_WORKERS = 2
 
 
 # =============================================================================
@@ -124,8 +132,8 @@ def setup_logging(output_dir: Path, bin_num: int) -> logging.Logger:
         ))
         logger.addHandler(fh)
 
-    # Console handler
-    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    # Console handler - use type() check to avoid matching FileHandler (which is a subclass)
+    if not any(type(h) is logging.StreamHandler for h in logger.handlers):
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
         ch.setFormatter(logging.Formatter('%(message)s'))
@@ -284,9 +292,13 @@ def run_migration_for_bin(
             taper_fraction=0.1,
         )
 
+        # CRITICAL: Enable amplitude corrections for proper Kirchhoff weighting
+        # - geometrical_spreading: 1/(v*t) - weights down far traces
+        # - obliquity_factor: t0/t - weights down steep ray contributions
+        # Without these, noise from far traces overwhelms the signal
         amplitude_config = AmplitudeConfig(
-            geometrical_spreading=False,
-            obliquity_factor=False,
+            geometrical_spreading=True,
+            obliquity_factor=True,
         )
 
         time_variant_config = TimeVariantConfig(
@@ -297,8 +309,8 @@ def run_migration_for_bin(
         )
 
         anti_aliasing_config = AntiAliasingConfig(
-            enabled=False,
-            method=AntiAliasingMethod.NONE,
+            enabled=True,  # AA enabled for noise suppression
+            method=AntiAliasingMethod.TRIANGLE,
         )
 
         algorithm_config = AlgorithmConfig(
@@ -376,6 +388,69 @@ def run_migration_for_bin(
 
 
 # =============================================================================
+# Parallel Worker Function
+# =============================================================================
+
+def _worker_run_bin(args_tuple: tuple) -> dict:
+    """
+    Worker function for parallel bin processing.
+
+    Must be a top-level function for multiprocessing pickle.
+
+    Args:
+        args_tuple: (bin_num, bin_info, common_offset_dir, output_dir, velocity_path)
+
+    Returns:
+        Result dictionary with bin, success, elapsed, message, n_traces
+    """
+    bin_num, bin_info, common_offset_dir, output_dir, velocity_path = args_tuple
+
+    # Setup per-process logging (minimal to avoid conflicts)
+    logging.basicConfig(
+        level=logging.WARNING,
+        format=f'[Worker-{bin_num:02d}] %(message)s'
+    )
+    logger = logging.getLogger(f"worker.{bin_num}")
+
+    print(f"[Worker-{bin_num:02d}] Starting migration ({bin_info['n_traces']:,} traces)", flush=True)
+
+    start_time = time.time()
+
+    try:
+        success, elapsed, message = run_migration_for_bin(
+            bin_num=bin_num,
+            common_offset_dir=Path(common_offset_dir),
+            output_dir=Path(output_dir),
+            velocity_path=Path(velocity_path),
+            logger=logger,
+        )
+
+        print(f"[Worker-{bin_num:02d}] Completed in {elapsed:.1f}s", flush=True)
+
+        return {
+            'bin': bin_num,
+            'success': success,
+            'elapsed': elapsed,
+            'message': message,
+            'n_traces': bin_info['n_traces'],
+        }
+
+    except Exception as e:
+        import traceback
+        elapsed = time.time() - start_time
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"[Worker-{bin_num:02d}] FAILED: {str(e)}", flush=True)
+
+        return {
+            'bin': bin_num,
+            'success': False,
+            'elapsed': elapsed,
+            'message': error_msg,
+            'n_traces': bin_info['n_traces'],
+        }
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -429,6 +504,22 @@ def main():
         action="store_true",
         help="Show what would be processed without running",
     )
+    parser.add_argument(
+        "--skip-velocity-check",
+        action="store_true",
+        help="Skip velocity coverage validation (not recommended)",
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Enable parallel processing of multiple bins",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_PARALLEL_WORKERS,
+        help=f"Number of parallel workers (default: {DEFAULT_PARALLEL_WORKERS})",
+    )
 
     args = parser.parse_args()
 
@@ -447,6 +538,45 @@ def main():
     print(f"Available offset bins: {len(available_bins)}")
     print(f"  Range: {min(available_bins)} - {max(available_bins)}")
     print()
+
+    # Validate velocity coverage
+    if not args.skip_velocity_check:
+        print("Validating velocity model coverage...")
+        output_grid = OutputGridConfig.from_corners(
+            corner1=GRID_CORNERS['c1'],
+            corner2=GRID_CORNERS['c2'],
+            corner3=GRID_CORNERS['c3'],
+            corner4=GRID_CORNERS['c4'],
+            dx=DX,
+            dy=DY,
+            t_min_ms=T_MIN_MS,
+            t_max_ms=T_MAX_MS,
+            dt_ms=DT_MS,
+        )
+        try:
+            coverage_report = validate_velocity_coverage(
+                velocity_path=args.velocity,
+                output_grid=output_grid,
+                raise_on_error=False,
+            )
+            if coverage_report.is_valid:
+                print(f"  PASSED: {coverage_report.message}")
+            else:
+                print()
+                coverage_report.print_report()
+                print()
+                print("WARNING: Velocity coverage is insufficient!")
+                print("         This may cause artifacts (diagonal lines) in migration output.")
+                print("         Consider running: python regenerate_velocity_cube.py")
+                print()
+                response = input("Continue anyway? [y/N]: ")
+                if response.lower() != 'y':
+                    print("Aborting.")
+                    return 1
+        except Exception as e:
+            print(f"  WARNING: Could not validate velocity coverage: {e}")
+            print("  Continuing without validation...")
+        print()
 
     # Parse requested bins
     requested_bins = parse_bin_range(args.bins, available_bins)
@@ -504,40 +634,96 @@ def main():
 
     # Process bins
     print("=" * 70)
-    print("Processing Offset Bins")
+    if args.parallel:
+        print(f"Processing Offset Bins (PARALLEL: {args.workers} workers)")
+    else:
+        print("Processing Offset Bins (sequential)")
     print("=" * 70)
 
     total_start = time.time()
     results = []
 
-    for i, (bin_num, bin_info) in enumerate(bins_to_process):
+    if args.parallel and len(bins_to_process) > 1:
+        # Parallel processing with ProcessPoolExecutor
+        print(f"\nStarting {min(args.workers, len(bins_to_process))} parallel workers...")
         print()
-        print(f"[{i+1}/{len(bins_to_process)}] Processing Bin {bin_num:02d}")
-        print("-" * 50)
 
-        success, elapsed, message = run_migration_for_bin(
-            bin_num=bin_num,
-            common_offset_dir=args.input_dir,
-            output_dir=args.output_dir,
-            velocity_path=args.velocity,
-            logger=logger,
-        )
+        # Prepare work items (convert Path objects to strings for pickle)
+        work_items = [
+            (
+                bin_num,
+                bin_info,
+                str(args.input_dir),
+                str(args.output_dir),
+                str(args.velocity),
+            )
+            for bin_num, bin_info in bins_to_process
+        ]
 
-        results.append({
-            'bin': bin_num,
-            'success': success,
-            'elapsed': elapsed,
-            'message': message,
-            'n_traces': bin_info['n_traces'],
-        })
+        # Use spawn context for macOS Metal compatibility
+        ctx = multiprocessing.get_context('spawn')
+        n_workers = min(args.workers, len(bins_to_process))
 
-        if success:
-            print(f"  COMPLETED in {elapsed:.1f}s")
-        else:
-            print(f"  FAILED: {message}")
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+            # Submit all jobs
+            future_to_bin = {
+                executor.submit(_worker_run_bin, item): item[0]
+                for item in work_items
+            }
 
-        # Force garbage collection between bins
-        gc.collect()
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_bin):
+                bin_num = future_to_bin[future]
+                completed += 1
+                try:
+                    result = future.result()
+                    results.append(result)
+                    status = "OK" if result['success'] else "FAILED"
+                    print(f"[{completed}/{len(bins_to_process)}] Bin {bin_num:02d}: {status} ({result['elapsed']:.1f}s)")
+                except Exception as e:
+                    print(f"[{completed}/{len(bins_to_process)}] Bin {bin_num:02d}: EXCEPTION - {e}")
+                    results.append({
+                        'bin': bin_num,
+                        'success': False,
+                        'elapsed': 0.0,
+                        'message': str(e),
+                        'n_traces': 0,
+                    })
+
+        # Sort results by bin number for consistent reporting
+        results.sort(key=lambda r: r['bin'])
+
+    else:
+        # Sequential processing (original behavior)
+        for i, (bin_num, bin_info) in enumerate(bins_to_process):
+            print()
+            print(f"[{i+1}/{len(bins_to_process)}] Processing Bin {bin_num:02d}")
+            print("-" * 50)
+
+            success, elapsed, message = run_migration_for_bin(
+                bin_num=bin_num,
+                common_offset_dir=args.input_dir,
+                output_dir=args.output_dir,
+                velocity_path=args.velocity,
+                logger=logger,
+            )
+
+            results.append({
+                'bin': bin_num,
+                'success': success,
+                'elapsed': elapsed,
+                'message': message,
+                'n_traces': bin_info['n_traces'],
+            })
+
+            if success:
+                print(f"  COMPLETED in {elapsed:.1f}s")
+            else:
+                print(f"  FAILED: {message}")
+
+            # Force garbage collection between bins
+            gc.collect()
 
     total_elapsed = time.time() - total_start
 

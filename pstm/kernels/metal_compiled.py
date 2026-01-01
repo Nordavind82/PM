@@ -289,6 +289,185 @@ class VTIParams(ctypes.Structure):
     ]
 
 
+def compute_optimal_threadgroup(
+    nx: int, ny: int, nt: int, max_threads: int
+) -> tuple[int, int, int]:
+    """
+    Compute optimal threadgroup dimensions for Metal dispatch.
+
+    Optimizes for Apple Silicon GPU characteristics:
+    - Prefers larger threadgroups for better occupancy
+    - Adjusts based on output dimensions and depth
+
+    Args:
+        nx: Grid width
+        ny: Grid height
+        nt: Grid depth (time samples)
+        max_threads: Maximum threads per threadgroup from pipeline state
+
+    Returns:
+        Tuple of (tg_width, tg_height, tg_depth)
+    """
+    # Apple Silicon GPUs work well with 256-1024 threads per threadgroup
+    # For 3D migration, balance spatial vs time dimensions
+
+    if nt >= 256:
+        # Deep data: prioritize time dimension for memory coalescing (OPTIMAL)
+        tg_width = min(4, nx)
+        tg_height = min(4, ny)
+        tg_depth = min(max_threads // (tg_width * tg_height), nt, 64)
+    elif nt >= 64:
+        # Medium depth: balanced approach
+        tg_width = min(8, nx)
+        tg_height = min(8, ny)
+        tg_depth = min(max_threads // (tg_width * tg_height), nt, 16)
+    else:
+        # Shallow data: prioritize spatial dimensions
+        tg_width = min(16, nx)
+        tg_height = min(16, ny)
+        remaining = max_threads // (tg_width * tg_height)
+        tg_depth = min(remaining, nt, 4)
+
+    # Ensure at least 1 for each dimension
+    tg_width = max(1, tg_width)
+    tg_height = max(1, tg_height)
+    tg_depth = max(1, tg_depth)
+
+    return tg_width, tg_height, tg_depth
+
+
+class MetalBufferPool:
+    """
+    Reusable Metal buffer pool to avoid per-tile allocations.
+
+    Buffers are pooled by size (rounded to power of 2) and reused across tiles.
+    This eliminates the overhead of creating new buffers for each tile.
+    """
+
+    def __init__(self, device):
+        """
+        Initialize buffer pool.
+
+        Args:
+            device: Metal device for buffer creation
+        """
+        self._device = device
+        self._pools: dict[int, list] = {}  # size -> [buffer, buffer, ...]
+        self._in_use: set[int] = set()  # buffer ids currently in use
+        self._stats = {"hits": 0, "misses": 0, "created": 0}
+
+    def _round_size(self, size: int) -> int:
+        """Round size up for efficient pooling.
+
+        For small/medium buffers: round to power of 2 for efficient reuse.
+        For large buffers (>2GB): round to nearest 256MB to avoid excessive overhead.
+        """
+        if size <= 0:
+            return 1
+
+        # For very large buffers, avoid power-of-2 rounding which can cause
+        # significant memory overhead (e.g., 6GB -> 8GB = 33% overhead)
+        large_threshold = 2 * 1024 * 1024 * 1024  # 2 GB
+        if size > large_threshold:
+            # Round up to nearest 256 MB instead
+            alignment = 256 * 1024 * 1024  # 256 MB
+            return ((size + alignment - 1) // alignment) * alignment
+
+        # Round up to next power of 2 for smaller buffers
+        size -= 1
+        size |= size >> 1
+        size |= size >> 2
+        size |= size >> 4
+        size |= size >> 8
+        size |= size >> 16
+        size |= size >> 32  # Support 64-bit sizes
+        return size + 1
+
+    def get_buffer(self, size: int, name: str = "") -> "Metal.MTLBuffer":
+        """
+        Get a buffer of at least `size` bytes.
+
+        Args:
+            size: Minimum buffer size in bytes
+            name: Optional name for logging
+
+        Returns:
+            Metal buffer of at least the requested size
+        """
+        rounded_size = self._round_size(size)
+
+        # Check if we have a pooled buffer of this size
+        if rounded_size in self._pools and self._pools[rounded_size]:
+            buf = self._pools[rounded_size].pop()
+            self._in_use.add(id(buf))
+            self._stats["hits"] += 1
+            return buf
+
+        # Create new buffer
+        self._stats["misses"] += 1
+        self._stats["created"] += 1
+
+        buf = self._device.newBufferWithLength_options_(
+            rounded_size,
+            Metal.MTLResourceStorageModeShared
+        )
+
+        if buf is None:
+            raise RuntimeError(f"Failed to create Metal buffer of size {rounded_size}")
+
+        self._in_use.add(id(buf))
+
+        if size > 100 * 1024 * 1024:  # Log large buffers
+            debug_logger.debug(
+                f"POOL [{name}] Created new {rounded_size / 1024**2:.1f} MB buffer "
+                f"(requested {size / 1024**2:.1f} MB)"
+            )
+
+        return buf
+
+    def release_buffer(self, buf: "Metal.MTLBuffer") -> None:
+        """
+        Return a buffer to the pool for reuse.
+
+        Args:
+            buf: Buffer to release
+        """
+        if buf is None:
+            return
+
+        buf_id = id(buf)
+        if buf_id in self._in_use:
+            self._in_use.remove(buf_id)
+
+        size = buf.length()
+        rounded_size = self._round_size(size)
+
+        if rounded_size not in self._pools:
+            self._pools[rounded_size] = []
+
+        self._pools[rounded_size].append(buf)
+
+    def release_all(self, buffers: list) -> None:
+        """Release multiple buffers back to pool."""
+        for buf in buffers:
+            self.release_buffer(buf)
+
+    def clear(self) -> None:
+        """Clear all pooled buffers."""
+        self._pools.clear()
+        self._in_use.clear()
+
+    def get_stats(self) -> dict:
+        """Get pool statistics."""
+        total_pooled = sum(len(bufs) for bufs in self._pools.values())
+        return {
+            **self._stats,
+            "pooled_buffers": total_pooled,
+            "in_use": len(self._in_use),
+            "hit_rate": self._stats["hits"] / max(1, self._stats["hits"] + self._stats["misses"]),
+        }
+
+
 class CompiledMetalKernel:
     """
     High-performance Metal kernel using compiled shaders.
@@ -319,6 +498,7 @@ class CompiledMetalKernel:
         self._library = None
         self._pipeline_state = None
         self._kernel_name = "pstm_migrate_3d_simd" if use_simd else "pstm_migrate_3d"
+        self._buffer_pool: MetalBufferPool | None = None
     
     @property
     def name(self) -> str:
@@ -347,7 +527,11 @@ class CompiledMetalKernel:
         self._command_queue = self._device.newCommandQueue()
         if self._command_queue is None:
             raise RuntimeError("Failed to create command queue")
-        
+
+        # Initialize buffer pool for efficient buffer reuse
+        self._buffer_pool = MetalBufferPool(self._device)
+        logger.info("Initialized Metal buffer pool")
+
         # Load compiled Metal library
         if not self.METALLIB_PATH.exists():
             raise RuntimeError(f"Metal library not found: {self.METALLIB_PATH}. Run scripts/build_metal.sh first.")
@@ -484,11 +668,11 @@ class CompiledMetalKernel:
         
         # Compute apertures for each time sample
         apertures = np.full(nt, config.max_aperture_m, dtype=np.float32)
-        
+
         # Output arrays
         image_out = np.zeros((nx, ny, nt), dtype=np.float32)
-        fold_out = np.zeros((nx, ny), dtype=np.int32)
-        
+        fold_out = np.zeros((nx, ny, nt), dtype=np.int32)  # 3D fold per sample
+
         # Create Metal buffers
         total_buffer_bytes = (amplitudes.nbytes + source_x.nbytes + source_y.nbytes +
                               receiver_x.nbytes + receiver_y.nbytes + midpoint_x.nbytes +
@@ -506,9 +690,10 @@ class CompiledMetalKernel:
         log_metal_memory("migrate_tile_after_buffers")
 
         # Create parameters
+        # Use actual grid bin spacing from config for AA filter (not linspace-derived)
         params = MigrationParams()
-        params.dx = output.x_axis[1] - output.x_axis[0] if nx > 1 else 25.0
-        params.dy = output.y_axis[1] - output.y_axis[0] if ny > 1 else 25.0
+        params.dx = config.grid_dx
+        params.dy = config.grid_dy
         params.dt_ms = traces.sample_rate_ms
         params.t_start_ms = traces.start_time_ms
         params.max_aperture = config.max_aperture_m
@@ -555,15 +740,13 @@ class CompiledMetalKernel:
         
         # Threadgroup size - optimize for GPU
         max_threads = self._pipeline_state.maxTotalThreadsPerThreadgroup()
-        tg_width = min(8, nx)
-        tg_height = min(8, ny)
-        tg_depth = min(max_threads // (tg_width * tg_height), nt)
-        
+        tg_width, tg_height, tg_depth = compute_optimal_threadgroup(nx, ny, nt, max_threads)
+
         threads_per_threadgroup = Metal.MTLSize()
         threads_per_threadgroup.width = tg_width
         threads_per_threadgroup.height = tg_height
         threads_per_threadgroup.depth = tg_depth
-        
+
         debug_logger.info(f"METAL dispatch: grid=({nx},{ny},{nt}), threadgroup=({tg_width},{tg_height},{tg_depth})")
         log_metal_memory("migrate_tile_before_dispatch")
 
@@ -586,7 +769,7 @@ class CompiledMetalKernel:
 
         # Copy to numpy arrays
         image_result = np.frombuffer(image_buf, dtype=np.float32).reshape(nx, ny, nt)
-        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny)
+        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny, nt)  # 3D fold
 
         # Copy to output
         output.image[:] = image_result.astype(np.float64)
@@ -596,10 +779,17 @@ class CompiledMetalKernel:
 
         debug_logger.info(f"METAL completed in {compute_time:.3f}s")
 
+        # Release buffers back to pool for reuse
+        if self._buffer_pool is not None:
+            self._buffer_pool.release_all(buffers)
+            self._buffer_pool.release_buffer(params_buffer)
+            stats = self._buffer_pool.get_stats()
+            debug_logger.debug(f"POOL stats: hits={stats['hits']}, misses={stats['misses']}, hit_rate={stats['hit_rate']:.1%}")
+
         # Explicit cleanup of Metal buffers to release unified memory
         del buffers, params_buffer, command_buffer, encoder
         del image_buf, fold_buf, image_result, fold_result
-        gc.collect()
+        gc.collect(generation=1)
         log_metal_memory("migrate_tile_after_cleanup")
 
         return KernelMetrics(
@@ -609,37 +799,91 @@ class CompiledMetalKernel:
         )
 
     def _create_buffer(self, arr: np.ndarray, name: str = "") -> "Metal.MTLBuffer":
-        """Create a Metal buffer from a numpy array.
+        """Create a Metal buffer from a numpy array using buffer pool.
+
+        OPTIMIZED FOR APPLE SILICON UMA:
+        Uses ctypes.memmove() for direct memory copy without intermediate
+        tobytes() allocation. This reduces copies from 2 to 1 on UMA systems.
 
         Args:
             arr: NumPy array to create buffer from
             name: Optional name for logging
 
-        Note: This creates a copy via tobytes(). For large arrays (>100MB),
-        consider using memory-mapped buffers or pre-allocated pools.
+        Returns:
+            Metal buffer with array data copied in.
+            Buffer is from pool if available, reducing allocation overhead.
         """
-        # Ensure contiguous - may create copy
-        arr_contig = np.ascontiguousarray(arr)
-        arr_bytes = arr.nbytes
+        # Ensure contiguous and correct byte order
+        # C-contiguous + native byte order required for Metal
+        if not arr.flags['C_CONTIGUOUS'] or arr.dtype.byteorder not in ('=', '|', '<'):
+            arr_contig = np.ascontiguousarray(arr)
+            made_copy = True
+        else:
+            arr_contig = arr
+            made_copy = False
+
+        arr_bytes = arr_contig.nbytes
 
         # Log memory for large buffers
         if arr_bytes > 100 * 1024 * 1024:  # > 100 MB
             debug_logger.debug(
                 f"METAL_BUF [{name}] Creating {arr_bytes / 1024**2:.1f} MB buffer "
-                f"(shape={arr.shape}, dtype={arr.dtype})"
+                f"(shape={arr.shape}, dtype={arr.dtype}, copy_made={made_copy})"
             )
 
-        # Create buffer - tobytes() creates another copy
-        buf = self._device.newBufferWithBytes_length_options_(
-            arr_contig.tobytes(),
-            arr_bytes,
-            Metal.MTLResourceStorageModeShared
-        )
+        # Use buffer pool if available
+        if self._buffer_pool is not None:
+            buf = self._buffer_pool.get_buffer(arr_bytes, name)
+            # OPTIMIZED: Copy directly into Metal buffer memory using memoryview
+            # This avoids the tobytes() intermediate allocation by using cast('B')
+            # which creates a bytes view of the numpy array without copying.
+            # On Apple Silicon UMA, this is a direct memory copy in unified memory.
+            buf_view = buf.contents().as_buffer(arr_bytes)
+            # Cast numpy array to bytes view and copy via memoryview slice assignment
+            buf_view[:] = memoryview(arr_contig).cast('B')
+        else:
+            # Fallback: Create new buffer and copy
+            buf = self._device.newBufferWithLength_options_(
+                arr_bytes,
+                Metal.MTLResourceStorageModeShared
+            )
+            if buf is None:
+                raise RuntimeError(f"Failed to create Metal buffer of size {arr_bytes}")
+            buf_view = buf.contents().as_buffer(arr_bytes)
+            buf_view[:] = memoryview(arr_contig).cast('B')
 
-        # Explicit cleanup of the bytes copy (helps GC)
-        del arr_contig
+        # Explicit cleanup only if we made a copy
+        if made_copy:
+            del arr_contig
 
         return buf
+
+    def _buffer_to_numpy(self, buf: "Metal.MTLBuffer", shape: tuple, dtype: np.dtype) -> np.ndarray:
+        """Create a numpy array view of Metal buffer memory (ZERO-COPY READ).
+
+        On Apple Silicon UMA, this creates a numpy view directly into the
+        Metal buffer's unified memory - no data copy occurs.
+
+        WARNING: The returned array is only valid while the buffer exists.
+        Do not use after the buffer is released back to the pool.
+
+        Args:
+            buf: Metal buffer to view
+            shape: Shape for the numpy array
+            dtype: Data type for the array
+
+        Returns:
+            NumPy array view into buffer memory
+        """
+        import ctypes
+        nbytes = np.prod(shape) * np.dtype(dtype).itemsize
+        # Get raw pointer to buffer contents
+        ptr = buf.contents()
+        # Create ctypes array from pointer
+        arr_type = ctypes.c_char * nbytes
+        c_arr = arr_type.from_address(ptr.__int__())
+        # Create numpy array view (no copy)
+        return np.frombuffer(c_arr, dtype=dtype).reshape(shape)
 
     def _create_buffers(
         self,
@@ -680,6 +924,13 @@ class CompiledMetalKernel:
     
     def cleanup(self) -> None:
         """Clean up resources."""
+        # Clear buffer pool first
+        if self._buffer_pool is not None:
+            stats = self._buffer_pool.get_stats()
+            logger.info(f"Buffer pool final stats: {stats}")
+            self._buffer_pool.clear()
+            self._buffer_pool = None
+
         self._initialized = False
         self._pipeline_state = None
         self._library = None
@@ -822,7 +1073,7 @@ class CompiledMetalKernel:
 
         # Output arrays (time-variant sized)
         image_out = np.zeros((nx, ny, total_output_samples), dtype=np.float32)
-        fold_out = np.zeros((nx, ny), dtype=np.int32)
+        fold_out = np.zeros((nx, ny, total_output_samples), dtype=np.int32)  # 3D fold per sample
 
         # Store sizes for later use when reading results (allows deleting arrays earlier)
         image_out_nbytes = image_out.nbytes
@@ -886,8 +1137,8 @@ class CompiledMetalKernel:
 
         # Create params
         params = TimeVariantParamsStruct()
-        params.dx = output.x_axis[1] - output.x_axis[0] if nx > 1 else 25.0
-        params.dy = output.y_axis[1] - output.y_axis[0] if ny > 1 else 25.0
+        params.dx = config.grid_dx
+        params.dy = config.grid_dy
         params.dt_base_ms = traces.sample_rate_ms
         params.t_start_ms = traces.start_time_ms
         params.max_aperture = config.max_aperture_m
@@ -929,14 +1180,12 @@ class CompiledMetalKernel:
         threads_per_grid.depth = total_output_samples
 
         max_threads = tv_pipeline.maxTotalThreadsPerThreadgroup()
-        tg_width = min(8, nx)
-        tg_height = min(8, ny)
-        tg_depth = min(max_threads // (tg_width * tg_height), total_output_samples)
+        tg_width, tg_height, tg_depth = compute_optimal_threadgroup(nx, ny, total_output_samples, max_threads)
 
         threads_per_threadgroup = Metal.MTLSize()
         threads_per_threadgroup.width = tg_width
         threads_per_threadgroup.height = tg_height
-        threads_per_threadgroup.depth = max(1, tg_depth)
+        threads_per_threadgroup.depth = tg_depth
 
         debug_logger.info(
             f"METAL TV dispatch: grid=({nx},{ny},{total_output_samples}), "
@@ -957,7 +1206,7 @@ class CompiledMetalKernel:
         fold_buf = buffers[8].contents().as_buffer(fold_out_nbytes)
 
         image_result = np.frombuffer(image_buf, dtype=np.float32).reshape(nx, ny, total_output_samples)
-        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny)
+        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny, total_output_samples)  # 3D fold
 
         # Store time-variant result (caller must resample to uniform)
         # We return the raw TV output - resampling is done by caller
@@ -1006,9 +1255,8 @@ class CompiledMetalKernel:
         # Drain autorelease pool to release Objective-C objects
         drain_autorelease_pool()
 
-        # Force garbage collection multiple times
-        gc.collect()
-        gc.collect()
+        # Single GC pass on youngest generation
+        gc.collect(generation=1)
 
         # Drain again after GC
         drain_autorelease_pool()
@@ -1096,7 +1344,7 @@ class CompiledMetalKernel:
 
         # Output arrays
         image_out = np.zeros((nx, ny, nt), dtype=np.float32)
-        fold_out = np.zeros((nx, ny), dtype=np.int32)
+        fold_out = np.zeros((nx, ny, nt), dtype=np.int32)  # 3D fold per sample
 
         # Create buffers
         buffers = [
@@ -1117,8 +1365,8 @@ class CompiledMetalKernel:
 
         # Create params
         params = CurvedRayParams()
-        params.dx = output.x_axis[1] - output.x_axis[0] if nx > 1 else 25.0
-        params.dy = output.y_axis[1] - output.y_axis[0] if ny > 1 else 25.0
+        params.dx = config.grid_dx
+        params.dy = config.grid_dy
         params.dt_ms = traces.sample_rate_ms
         params.t_start_ms = traces.start_time_ms
         params.max_aperture = config.max_aperture_m
@@ -1159,14 +1407,12 @@ class CompiledMetalKernel:
         threads_per_grid.depth = nt
 
         max_threads = cr_pipeline.maxTotalThreadsPerThreadgroup()
-        tg_width = min(8, nx)
-        tg_height = min(8, ny)
-        tg_depth = min(max_threads // (tg_width * tg_height), nt)
+        tg_width, tg_height, tg_depth = compute_optimal_threadgroup(nx, ny, nt, max_threads)
 
         threads_per_threadgroup = Metal.MTLSize()
         threads_per_threadgroup.width = tg_width
         threads_per_threadgroup.height = tg_height
-        threads_per_threadgroup.depth = max(1, tg_depth)
+        threads_per_threadgroup.depth = tg_depth
 
         debug_logger.info(
             f"METAL curved_ray dispatch: grid=({nx},{ny},{nt}), "
@@ -1187,7 +1433,7 @@ class CompiledMetalKernel:
         fold_buf = buffers[8].contents().as_buffer(fold_out.nbytes)
 
         image_result = np.frombuffer(image_buf, dtype=np.float32).reshape(nx, ny, nt)
-        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny)
+        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny, nt)  # 3D fold
 
         output.image[:] = image_result.astype(np.float64)
         output.fold[:] = fold_result
@@ -1298,7 +1544,7 @@ class CompiledMetalKernel:
 
         # Output arrays
         image_out = np.zeros((nx, ny, nt), dtype=np.float32)
-        fold_out = np.zeros((nx, ny), dtype=np.int32)
+        fold_out = np.zeros((nx, ny, nt), dtype=np.int32)  # 3D fold per sample
 
         # Create buffers
         buffers = [
@@ -1322,8 +1568,8 @@ class CompiledMetalKernel:
 
         # Create params
         params = VTIParams()
-        params.dx = output.x_axis[1] - output.x_axis[0] if nx > 1 else 25.0
-        params.dy = output.y_axis[1] - output.y_axis[0] if ny > 1 else 25.0
+        params.dx = config.grid_dx
+        params.dy = config.grid_dy
         params.dt_ms = traces.sample_rate_ms
         params.t_start_ms = traces.start_time_ms
         params.max_aperture = config.max_aperture_m
@@ -1364,14 +1610,12 @@ class CompiledMetalKernel:
         threads_per_grid.depth = nt
 
         max_threads = vti_pipeline.maxTotalThreadsPerThreadgroup()
-        tg_width = min(8, nx)
-        tg_height = min(8, ny)
-        tg_depth = min(max_threads // (tg_width * tg_height), nt)
+        tg_width, tg_height, tg_depth = compute_optimal_threadgroup(nx, ny, nt, max_threads)
 
         threads_per_threadgroup = Metal.MTLSize()
         threads_per_threadgroup.width = tg_width
         threads_per_threadgroup.height = tg_height
-        threads_per_threadgroup.depth = max(1, tg_depth)
+        threads_per_threadgroup.depth = tg_depth
 
         debug_logger.info(
             f"METAL VTI dispatch: grid=({nx},{ny},{nt}), "
@@ -1392,7 +1636,7 @@ class CompiledMetalKernel:
         fold_buf = buffers[8].contents().as_buffer(fold_out.nbytes)
 
         image_result = np.frombuffer(image_buf, dtype=np.float32).reshape(nx, ny, nt)
-        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny)
+        fold_result = np.frombuffer(fold_buf, dtype=np.int32).reshape(nx, ny, nt)  # 3D fold
 
         output.image[:] = image_result.astype(np.float64)
         output.fold[:] = fold_result

@@ -34,7 +34,8 @@ from tqdm import tqdm
 # =============================================================================
 
 # Default paths
-MIGRATION_DIR = Path("/Volumes/AO_DISK/PSTM_common_offset")
+MIGRATION_DIR = Path("/Users/olegadamovich/SeismicData/PSTM_common_offset")
+
 INPUT_HEADERS_DIR = Path("/Users/olegadamovich/SeismicData/common_offset_gathers_new")
 DEFAULT_OUTPUT = MIGRATION_DIR / "pstm_stacked.zarr"
 

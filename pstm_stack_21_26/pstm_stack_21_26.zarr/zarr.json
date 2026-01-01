@@ -1,0 +1,64 @@
+{
+  "shape": [
+    511,
+    427,
+    1001
+  ],
+  "data_type": "float32",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        64,
+        64,
+        1001
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0.0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {
+    "bins": [
+      21,
+      22,
+      23,
+      24,
+      25,
+      26
+    ],
+    "n_bins": 6,
+    "x_min": 618813.59,
+    "x_max": 627094.02,
+    "dx": 25.0,
+    "y_min": 5116498.5,
+    "y_max": 5119956.77,
+    "dy": 12.5,
+    "t_min_ms": 0.0,
+    "t_max_ms": 2000.0,
+    "dt_ms": 2.0,
+    "migration_type": "PSTM"
+  },
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}

@@ -147,7 +147,7 @@ kernel void pstm_migrate_3d(
 
     // Output arrays
     device float* image [[buffer(7)]],                 // [nx, ny, nt] - non-atomic, unique per thread
-    device atomic_int* fold [[buffer(8)]],             // [nx, ny]
+    device int* fold [[buffer(8)]],                    // [nx, ny, nt] - 3D fold per sample (non-atomic, unique per thread)
 
     // Grid coordinates (flattened 2D for rotated grid support)
     device const float* x_coords [[buffer(9)]],        // [nx*ny] flattened X coordinates
@@ -195,11 +195,16 @@ kernel void pstm_migrate_3d(
         inv_v_sq_val = inv_v_sq[it];
     }
     float velocity = 1.0f / sqrt(inv_v_sq_val);  // Recover velocity
-    
+
+    // Pre-compute squared aperture to avoid sqrt in inner loop
+    float aperture_sq = aperture * aperture;
+    float taper_start = aperture * (1.0f - params.taper_fraction);
+    float taper_start_sq = taper_start * taper_start;
+
     // Accumulator for this output sample
     float local_sum = 0.0f;
     int trace_count = 0;
-    
+
     // Process all input traces
     for (int tr = 0; tr < params.n_traces; tr++) {
         // Get trace geometry
@@ -209,12 +214,12 @@ kernel void pstm_migrate_3d(
         float ry = receiver_y[tr];
         float mx = midpoint_x[tr];
         float my = midpoint_y[tr];
-        
-        // Distance from output point to midpoint (for aperture check)
-        float dm = sqrt((ox - mx) * (ox - mx) + (oy - my) * (oy - my));
-        
-        // Aperture check
-        if (dm > aperture) {
+
+        // Squared distance from output point to midpoint (avoids sqrt for aperture check)
+        float dm_sq = (ox - mx) * (ox - mx) + (oy - my) * (oy - my);
+
+        // Aperture check using squared distance (faster - no sqrt needed)
+        if (dm_sq > aperture_sq) {
             continue;
         }
         
@@ -236,9 +241,14 @@ kernel void pstm_migrate_3d(
         // Get interpolated amplitude
         device const float* trace = amplitudes + tr * params.n_samples;
         float amp = linear_interp(trace, params.n_samples, sample_idx);
-        
-        // Apply aperture taper
-        amp *= compute_taper(dm, aperture, params.taper_fraction);
+
+        // Apply aperture taper (only compute sqrt if within taper zone)
+        if (dm_sq > taper_start_sq) {
+            float dm = sqrt(dm_sq);  // Only compute sqrt when in taper zone
+            float t = (dm - taper_start) / (aperture - taper_start);
+            amp *= 0.5f * (1.0f + cos(t * M_PI_F));
+        }
+        // else: amp *= 1.0 (no taper needed)
         
         // Apply anti-aliasing weight
         if (params.apply_aa) {
@@ -268,12 +278,11 @@ kernel void pstm_migrate_3d(
     // Write to output image (no atomic needed - each thread writes unique location)
     int img_idx = ix * params.ny * params.nt + iy * params.nt + it;
     image[img_idx] = local_sum;
-    
-    // Update fold (only for first time sample to avoid overcounting)
-    if (it == 0 && trace_count > 0) {
-        int fold_idx = ix * params.ny + iy;
-        atomic_fetch_add_explicit(&fold[fold_idx], trace_count, memory_order_relaxed);
-    }
+
+    // Update fold for this time sample (3D fold - each sample has its own count)
+    // Using non-atomic write since each (ix, iy, it) thread writes unique location
+    int fold_idx = ix * params.ny * params.nt + iy * params.nt + it;
+    fold[fold_idx] = trace_count;
 }
 
 // =============================================================================
@@ -288,7 +297,7 @@ kernel void pstm_migrate_3d_simd(
     device const float* midpoint_x [[buffer(5)]],
     device const float* midpoint_y [[buffer(6)]],
     device float* image [[buffer(7)]],
-    device atomic_int* fold [[buffer(8)]],
+    device int* fold [[buffer(8)]],         // [nx, ny, nt] - 3D fold per sample (non-atomic, unique per thread)
     device const float* x_coords [[buffer(9)]],
     device const float* y_coords [[buffer(10)]],
     device const float* t0_half_sq [[buffer(11)]],
@@ -313,7 +322,18 @@ kernel void pstm_migrate_3d_simd(
     float aperture = apertures[it];
     float aperture_sq = aperture * aperture;
     float t0_half_sq_val = t0_half_sq[it];
-    float inv_v_sq_val = inv_v_sq[it];
+
+    // Get velocity - support both 1D and 3D velocity models (FIX: was always using 1D)
+    float inv_v_sq_val;
+    if (params.use_3d_velocity) {
+        // 3D velocity: index by (ix, iy, it) - same layout as output image
+        int vel_idx = ix * params.ny * params.nt + iy * params.nt + it;
+        inv_v_sq_val = inv_v_sq[vel_idx];
+    } else {
+        // 1D velocity: index by time only
+        inv_v_sq_val = inv_v_sq[it];
+    }
+
     float t0_val = t0_s[it];
     float velocity = 1.0f / sqrt(inv_v_sq_val);
     float taper_start = aperture * (1.0f - params.taper_fraction);
@@ -459,10 +479,9 @@ kernel void pstm_migrate_3d_simd(
     int img_idx = ix * params.ny * params.nt + iy * params.nt + it;
     image[img_idx] = local_sum;
 
-    if (it == 0 && trace_count > 0) {
-        int fold_idx = ix * params.ny + iy;
-        atomic_fetch_add_explicit(&fold[fold_idx], trace_count, memory_order_relaxed);
-    }
+    // Update fold for this time sample (3D fold - each sample has its own count)
+    int fold_idx = ix * params.ny * params.nt + iy * params.nt + it;
+    fold[fold_idx] = trace_count;
 }
 
 // =============================================================================
@@ -534,7 +553,7 @@ kernel void pstm_migrate_time_variant(
 
     // Output arrays
     device float* image [[buffer(7)]],
-    device atomic_int* fold [[buffer(8)]],
+    device int* fold [[buffer(8)]],                // [nx, ny, total_output_samples] - 3D fold per sample (non-atomic)
 
     // Grid coordinates (flattened 2D for rotated grid support)
     device const float* x_coords [[buffer(9)]],    // [nx*ny] flattened X coordinates
@@ -676,9 +695,7 @@ kernel void pstm_migrate_time_variant(
     int img_idx = ix * params.ny * params.total_output_samples + iy * params.total_output_samples + flat_idx;
     image[img_idx] = local_sum;
 
-    // Update fold for first sample only
-    if (flat_idx == 0 && trace_count > 0) {
-        int fold_idx = ix * params.ny + iy;
-        atomic_fetch_add_explicit(&fold[fold_idx], trace_count, memory_order_relaxed);
-    }
+    // Update fold for this time sample (3D fold - each sample has its own count)
+    int fold_idx = ix * params.ny * params.total_output_samples + iy * params.total_output_samples + flat_idx;
+    fold[fold_idx] = trace_count;
 }

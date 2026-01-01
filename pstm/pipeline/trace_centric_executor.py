@@ -151,7 +151,7 @@ def run_trace_centric_migration(
     # Prepare output tile for full grid
     output_tile = OutputTile(
         image=np.zeros((output_grid.nx, output_grid.ny, output_grid.nt), dtype=np.float64),
-        fold=np.zeros((output_grid.nx, output_grid.ny), dtype=np.int32),
+        fold=np.zeros((output_grid.nx, output_grid.ny, output_grid.nt), dtype=np.int32),  # 3D fold per sample
         x_axis=np.linspace(
             output_grid.x_min, output_grid.x_max, output_grid.nx
         ),

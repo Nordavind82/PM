@@ -2,11 +2,13 @@
 Velocity model handler for PSTM.
 
 Supports various velocity sources: constant, 1D function, 1D table, 3D cube.
+Includes coverage validation for rotated grids.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +20,73 @@ from pstm.config.models import VelocityConfig, VelocitySource
 from pstm.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class VelocityCoverageReport:
+    """Report on velocity cube coverage of output grid."""
+
+    # Coverage status
+    is_valid: bool
+
+    # Velocity cube bounds
+    vel_x_min: float
+    vel_x_max: float
+    vel_y_min: float
+    vel_y_max: float
+
+    # Required bounds (from output grid)
+    grid_x_min: float
+    grid_x_max: float
+    grid_y_min: float
+    grid_y_max: float
+
+    # Coverage gaps (positive = gap exists)
+    gap_x_min: float  # How much grid extends below velocity X min
+    gap_x_max: float  # How much grid extends above velocity X max
+    gap_y_min: float  # How much grid extends below velocity Y min
+    gap_y_max: float  # How much grid extends above velocity Y max
+
+    # Percentage of output points outside velocity coverage
+    points_outside_percent: float
+
+    # Detailed message
+    message: str
+
+    def __str__(self) -> str:
+        status = "VALID" if self.is_valid else "INVALID"
+        return f"VelocityCoverageReport({status}): {self.message}"
+
+    def print_report(self) -> None:
+        """Print detailed coverage report."""
+        print("=" * 70)
+        print("VELOCITY COVERAGE REPORT")
+        print("=" * 70)
+        print(f"Status: {'VALID' if self.is_valid else 'INVALID - COVERAGE GAP DETECTED'}")
+        print()
+        print("Velocity Cube Bounds:")
+        print(f"  X: [{self.vel_x_min:.1f}, {self.vel_x_max:.1f}]")
+        print(f"  Y: [{self.vel_y_min:.1f}, {self.vel_y_max:.1f}]")
+        print()
+        print("Output Grid Bounds (required):")
+        print(f"  X: [{self.grid_x_min:.1f}, {self.grid_x_max:.1f}]")
+        print(f"  Y: [{self.grid_y_min:.1f}, {self.grid_y_max:.1f}]")
+        print()
+        if not self.is_valid:
+            print("Coverage Gaps:")
+            if self.gap_x_min > 0:
+                print(f"  X min: {self.gap_x_min:.1f}m below velocity coverage")
+            if self.gap_x_max > 0:
+                print(f"  X max: {self.gap_x_max:.1f}m above velocity coverage")
+            if self.gap_y_min > 0:
+                print(f"  Y min: {self.gap_y_min:.1f}m below velocity coverage")
+            if self.gap_y_max > 0:
+                print(f"  Y max: {self.gap_y_max:.1f}m above velocity coverage")
+            print()
+            print(f"Points outside coverage: {self.points_outside_percent:.1f}%")
+        print()
+        print(f"Message: {self.message}")
+        print("=" * 70)
 
 
 class VelocityModel(ABC):
@@ -315,12 +384,150 @@ class CubeVelocityModel(VelocityModel):
         if self._transposed:
             data = data.T
 
+        # Store data for boundary clamping
+        self._data = data
+
         self._interpolator = RegularGridInterpolator(
             (self.x_axis, self.y_axis, self.t_axis_ms),
             data,
             method="linear",
             bounds_error=False,
-            fill_value=None,  # Extrapolate
+            fill_value=None,  # Will use clamping instead
+        )
+
+    def _clamp_coordinates(
+        self,
+        points: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """
+        Clamp query coordinates to velocity cube bounds.
+
+        This prevents extrapolation artifacts by using edge velocities
+        for points outside the velocity cube coverage.
+
+        Args:
+            points: Query points of shape (N, 3) with columns [x, y, t]
+
+        Returns:
+            Clamped points array
+        """
+        clamped = points.copy()
+
+        # Clamp X
+        clamped[:, 0] = np.clip(clamped[:, 0], self.x_axis[0], self.x_axis[-1])
+        # Clamp Y
+        clamped[:, 1] = np.clip(clamped[:, 1], self.y_axis[0], self.y_axis[-1])
+        # Clamp T
+        clamped[:, 2] = np.clip(clamped[:, 2], self.t_axis_ms[0], self.t_axis_ms[-1])
+
+        return clamped
+
+    def check_coverage(
+        self,
+        x_grid: NDArray[np.float64] | None = None,
+        y_grid: NDArray[np.float64] | None = None,
+        x_axis: NDArray[np.float64] | None = None,
+        y_axis: NDArray[np.float64] | None = None,
+        tolerance_m: float = 1.0,
+    ) -> VelocityCoverageReport:
+        """
+        Check if velocity cube covers the output grid.
+
+        Args:
+            x_grid: 2D X coordinate grid (nx, ny) for rotated grids
+            y_grid: 2D Y coordinate grid (nx, ny) for rotated grids
+            x_axis: 1D X axis for axis-aligned grids
+            y_axis: 1D Y axis for axis-aligned grids
+            tolerance_m: Tolerance in meters for boundary checks
+
+        Returns:
+            VelocityCoverageReport with detailed coverage analysis
+        """
+        # Determine output grid bounds
+        if x_grid is not None and y_grid is not None:
+            # Rotated grid - use 2D coordinates
+            grid_x_min = float(x_grid.min())
+            grid_x_max = float(x_grid.max())
+            grid_y_min = float(y_grid.min())
+            grid_y_max = float(y_grid.max())
+            n_points = x_grid.size
+
+            # Count points outside
+            outside_x = (x_grid < self.x_axis[0]) | (x_grid > self.x_axis[-1])
+            outside_y = (y_grid < self.y_axis[0]) | (y_grid > self.y_axis[-1])
+            outside = outside_x | outside_y
+            points_outside = np.sum(outside)
+        elif x_axis is not None and y_axis is not None:
+            # Axis-aligned grid
+            grid_x_min = float(x_axis.min())
+            grid_x_max = float(x_axis.max())
+            grid_y_min = float(y_axis.min())
+            grid_y_max = float(y_axis.max())
+            n_points = len(x_axis) * len(y_axis)
+            points_outside = 0  # Axis-aligned, count below
+        else:
+            raise ValueError("Must provide either (x_grid, y_grid) or (x_axis, y_axis)")
+
+        # Velocity cube bounds
+        vel_x_min = float(self.x_axis[0])
+        vel_x_max = float(self.x_axis[-1])
+        vel_y_min = float(self.y_axis[0])
+        vel_y_max = float(self.y_axis[-1])
+
+        # Calculate gaps
+        gap_x_min = max(0, vel_x_min - grid_x_min)
+        gap_x_max = max(0, grid_x_max - vel_x_max)
+        gap_y_min = max(0, vel_y_min - grid_y_min)
+        gap_y_max = max(0, grid_y_max - vel_y_max)
+
+        # For axis-aligned, estimate points outside
+        if x_axis is not None and y_axis is not None:
+            nx_outside = np.sum((x_axis < vel_x_min) | (x_axis > vel_x_max))
+            ny_outside = np.sum((y_axis < vel_y_min) | (y_axis > vel_y_max))
+            # Rough estimate
+            points_outside = nx_outside * len(y_axis) + ny_outside * len(x_axis)
+
+        points_outside_percent = 100.0 * points_outside / n_points if n_points > 0 else 0
+
+        # Determine validity
+        is_valid = (
+            gap_x_min <= tolerance_m
+            and gap_x_max <= tolerance_m
+            and gap_y_min <= tolerance_m
+            and gap_y_max <= tolerance_m
+        )
+
+        # Build message
+        if is_valid:
+            message = "Velocity cube fully covers output grid"
+        else:
+            gaps = []
+            if gap_x_min > tolerance_m:
+                gaps.append(f"X min gap: {gap_x_min:.1f}m")
+            if gap_x_max > tolerance_m:
+                gaps.append(f"X max gap: {gap_x_max:.1f}m")
+            if gap_y_min > tolerance_m:
+                gaps.append(f"Y min gap: {gap_y_min:.1f}m")
+            if gap_y_max > tolerance_m:
+                gaps.append(f"Y max gap: {gap_y_max:.1f}m")
+            message = f"Coverage gaps detected: {', '.join(gaps)}"
+
+        return VelocityCoverageReport(
+            is_valid=is_valid,
+            vel_x_min=vel_x_min,
+            vel_x_max=vel_x_max,
+            vel_y_min=vel_y_min,
+            vel_y_max=vel_y_max,
+            grid_x_min=grid_x_min,
+            grid_x_max=grid_x_max,
+            grid_y_min=grid_y_min,
+            grid_y_max=grid_y_max,
+            gap_x_min=gap_x_min,
+            gap_x_max=gap_x_max,
+            gap_y_min=gap_y_min,
+            gap_y_max=gap_y_max,
+            points_outside_percent=points_outside_percent,
+            message=message,
         )
 
     def get_vrms_1d(self, t_axis_ms: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -343,6 +550,9 @@ class CubeVelocityModel(VelocityModel):
             np.full_like(t_axis_ms, y),
             t_axis_ms,
         ])
+
+        # Clamp coordinates to velocity cube bounds
+        points = self._clamp_coordinates(points)
 
         return self._interpolator(points)
 
@@ -406,6 +616,8 @@ class CubeVelocityModel(VelocityModel):
             else:
                 xx, yy, tt = np.meshgrid(x_axis, y_axis, t_axis_ms, indexing="ij")
                 points = np.column_stack([xx.ravel(), yy.ravel(), tt.ravel()])
+            # Clamp coordinates to velocity cube bounds
+            points = self._clamp_coordinates(points)
             vrms_flat = self._interpolator(points)
             return vrms_flat.reshape((nx, ny, nt))
 
@@ -447,6 +659,9 @@ class CubeVelocityModel(VelocityModel):
                     xx, yy, tt = np.meshgrid(chunk_x, chunk_y, t_axis_ms, indexing="ij")
 
                 points = np.column_stack([xx.ravel(), yy.ravel(), tt.ravel()])
+
+                # Clamp coordinates to velocity cube bounds
+                points = self._clamp_coordinates(points)
 
                 # Interpolate chunk
                 vrms_chunk = self._interpolator(points).reshape((chunk_nx, chunk_ny, nt))
@@ -610,6 +825,12 @@ class VelocityManager:
         self._is_1d = model.is_laterally_constant
         self._is_rotated = output_x_grid is not None and output_y_grid is not None
 
+        # Cache for velocity slices (lazy slicing optimization)
+        # Key: (x_start, x_end, y_start, y_end) -> VelocitySlice
+        self._slice_cache: dict[tuple[int, int, int, int], object] = {}
+        self._slice_cache_hits = 0
+        self._slice_cache_misses = 0
+
         if self._is_rotated:
             logger.info("VelocityManager: Using 2D coordinate grids for rotated grid support")
 
@@ -687,29 +908,46 @@ class VelocityManager:
         y_end: int,
     ):
         """
-        Get VelocitySlice object for a tile.
-        
+        Get VelocitySlice object for a tile (cached).
+
+        Uses lazy slicing with caching to avoid redundant slice creation
+        when the same tile bounds are requested multiple times.
+
         Args:
             x_start, x_end: X index range
             y_start, y_end: Y index range
-            
+
         Returns:
             VelocitySlice for kernel consumption
         """
         from pstm.kernels.base import VelocitySlice
-        
+
+        # Check cache first
+        cache_key = (x_start, x_end, y_start, y_end)
+        if cache_key in self._slice_cache:
+            self._slice_cache_hits += 1
+            return self._slice_cache[cache_key]
+
+        self._slice_cache_misses += 1
+
         vrms, is_1d = self.get_velocity_for_tile(x_start, x_end, y_start, y_end)
-        
+
         if is_1d:
-            return VelocitySlice(vrms=vrms, is_1d=True)
+            vel_slice = VelocitySlice(vrms=vrms, is_1d=True)
         else:
-            return VelocitySlice(
+            vel_slice = VelocitySlice(
                 vrms=vrms,
                 is_1d=False,
                 x_axis=self.output_x_axis[x_start:x_end],
                 y_axis=self.output_y_axis[y_start:y_end],
                 t_axis_ms=self.output_t_axis_ms,
             )
+
+        # Cache the slice (limited to ~100 entries to prevent memory issues)
+        if len(self._slice_cache) < 100:
+            self._slice_cache[cache_key] = vel_slice
+
+        return vel_slice
     
     @property
     def memory_usage_gb(self) -> float:
@@ -717,6 +955,18 @@ class VelocityManager:
         if self._precomputed is None:
             return 0.0
         return self._precomputed.nbytes / (1024**3)
+
+    def get_slice_cache_stats(self) -> dict:
+        """Get velocity slice cache statistics."""
+        total = self._slice_cache_hits + self._slice_cache_misses
+        hit_rate = self._slice_cache_hits / total if total > 0 else 0.0
+        return {
+            "hits": self._slice_cache_hits,
+            "misses": self._slice_cache_misses,
+            "total": total,
+            "hit_rate": hit_rate,
+            "cached_slices": len(self._slice_cache),
+        }
 
 
 def create_velocity_manager(
@@ -748,6 +998,49 @@ def create_velocity_manager(
     x_grid = coords.get('X')  # 2D grid (nx, ny)
     y_grid = coords.get('Y')  # 2D grid (nx, ny)
 
+    # Check if velocity cube is in IL/XL space (indexed by inline/crossline numbers)
+    # rather than X/Y UTM coordinates. This is detected by checking if the velocity
+    # axes look like integer indices (1, 2, 3, ...) rather than UTM coordinates.
+    if isinstance(model, CubeVelocityModel):
+        vel_x_axis = model.x_axis
+        vel_y_axis = model.y_axis
+
+        # Detect IL/XL indexed velocity cube:
+        # - Axes start at 1 (or close to it)
+        # - Axes are integers or very close to integers
+        # - Range is small (< 1000) rather than UTM scale (> 100000)
+        is_ilxl_indexed = (
+            vel_x_axis[0] < 10 and  # Starts near 1
+            vel_y_axis[0] < 10 and
+            vel_x_axis[-1] < 1000 and  # Small range
+            vel_y_axis[-1] < 1000 and
+            np.allclose(vel_x_axis, np.round(vel_x_axis)) and  # Integer values
+            np.allclose(vel_y_axis, np.round(vel_y_axis))
+        )
+
+        if is_ilxl_indexed:
+            logger.info(
+                f"Detected IL/XL indexed velocity cube: "
+                f"IL=[{vel_x_axis[0]:.0f}, {vel_x_axis[-1]:.0f}], "
+                f"XL=[{vel_y_axis[0]:.0f}, {vel_y_axis[-1]:.0f}]"
+            )
+
+            # Create IL/XL coordinate grids for the output grid
+            # Output grid point (ix, iy) corresponds to IL=ix+1, XL=iy+1
+            nx, ny = len(x_axis), len(y_axis)
+            il_grid = np.arange(1, nx + 1, dtype=np.float64)[:, np.newaxis] * np.ones(ny)
+            xl_grid = np.ones(nx)[:, np.newaxis] * np.arange(1, ny + 1, dtype=np.float64)
+
+            logger.info(
+                f"Created IL/XL grids for velocity sampling: "
+                f"IL=[{il_grid.min():.0f}, {il_grid.max():.0f}], "
+                f"XL=[{xl_grid.min():.0f}, {xl_grid.max():.0f}]"
+            )
+
+            # Use IL/XL grids instead of X/Y grids for velocity sampling
+            x_grid = il_grid
+            y_grid = xl_grid
+
     return VelocityManager(
         model=model,
         output_x_axis=x_axis,
@@ -757,3 +1050,145 @@ def create_velocity_manager(
         output_x_grid=x_grid,
         output_y_grid=y_grid,
     )
+
+
+def validate_velocity_coverage(
+    velocity_path: Path | str,
+    output_grid,  # OutputGridConfig
+    raise_on_error: bool = False,
+) -> VelocityCoverageReport:
+    """
+    Validate that a velocity cube covers the output grid.
+
+    This should be called before migration to detect coverage gaps
+    that would cause artifacts (diagonal lines in time/crossline slices).
+
+    Args:
+        velocity_path: Path to velocity cube (zarr)
+        output_grid: Output grid configuration
+        raise_on_error: If True, raise ValueError on coverage gap
+
+    Returns:
+        VelocityCoverageReport with detailed analysis
+
+    Raises:
+        ValueError: If raise_on_error=True and coverage is invalid
+    """
+    # Load velocity model
+    model = CubeVelocityModel(velocity_path)
+
+    # Get output coordinates
+    coords = output_grid.get_output_coordinates()
+    x_grid = coords.get('X')
+    y_grid = coords.get('Y')
+    x_axis = coords.get('x')
+    y_axis = coords.get('y')
+
+    # Check if velocity cube is IL/XL indexed
+    vel_x_axis = model.x_axis
+    vel_y_axis = model.y_axis
+    is_ilxl_indexed = (
+        vel_x_axis[0] < 10 and
+        vel_y_axis[0] < 10 and
+        vel_x_axis[-1] < 1000 and
+        vel_y_axis[-1] < 1000 and
+        np.allclose(vel_x_axis, np.round(vel_x_axis)) and
+        np.allclose(vel_y_axis, np.round(vel_y_axis))
+    )
+
+    if is_ilxl_indexed:
+        # For IL/XL indexed cubes, check that IL/XL ranges cover output grid
+        nx, ny = len(x_axis), len(y_axis)
+        il_min, il_max = 1, nx  # Output grid IL range
+        xl_min, xl_max = 1, ny  # Output grid XL range
+
+        # Create IL/XL grids for coverage check
+        il_grid = np.arange(1, nx + 1, dtype=np.float64)[:, np.newaxis] * np.ones(ny)
+        xl_grid = np.ones(nx)[:, np.newaxis] * np.arange(1, ny + 1, dtype=np.float64)
+
+        logger.info(
+            f"Validating IL/XL indexed velocity cube: "
+            f"Velocity IL=[{vel_x_axis[0]:.0f}, {vel_x_axis[-1]:.0f}], "
+            f"XL=[{vel_y_axis[0]:.0f}, {vel_y_axis[-1]:.0f}]; "
+            f"Required IL=[{il_min}, {il_max}], XL=[{xl_min}, {xl_max}]"
+        )
+
+        report = model.check_coverage(
+            x_grid=il_grid,
+            y_grid=xl_grid,
+        )
+    else:
+        # Standard X/Y coverage check
+        report = model.check_coverage(
+            x_grid=x_grid,
+            y_grid=y_grid,
+            x_axis=x_axis,
+            y_axis=y_axis,
+        )
+
+    # Log result
+    if report.is_valid:
+        logger.info(f"Velocity coverage check PASSED: {report.message}")
+    else:
+        logger.error(f"Velocity coverage check FAILED: {report.message}")
+        if is_ilxl_indexed:
+            logger.error(
+                f"  Velocity bounds: IL [{report.vel_x_min:.0f}, {report.vel_x_max:.0f}], "
+                f"XL [{report.vel_y_min:.0f}, {report.vel_y_max:.0f}]"
+            )
+            logger.error(
+                f"  Grid bounds:     IL [{report.grid_x_min:.0f}, {report.grid_x_max:.0f}], "
+                f"XL [{report.grid_y_min:.0f}, {report.grid_y_max:.0f}]"
+            )
+        else:
+            logger.error(
+                f"  Velocity bounds: X [{report.vel_x_min:.1f}, {report.vel_x_max:.1f}], "
+                f"Y [{report.vel_y_min:.1f}, {report.vel_y_max:.1f}]"
+            )
+            logger.error(
+                f"  Grid bounds:     X [{report.grid_x_min:.1f}, {report.grid_x_max:.1f}], "
+                f"Y [{report.grid_y_min:.1f}, {report.grid_y_max:.1f}]"
+            )
+        logger.error(f"  Points outside coverage: {report.points_outside_percent:.1f}%")
+
+        if raise_on_error:
+            raise ValueError(f"Velocity coverage check failed: {report.message}")
+
+    return report
+
+
+def get_required_velocity_bounds(output_grid) -> dict:
+    """
+    Get the required velocity cube bounds for an output grid.
+
+    Use this to determine what bounds a velocity cube needs to cover
+    the entire output grid (including rotated grids).
+
+    Args:
+        output_grid: Output grid configuration
+
+    Returns:
+        Dictionary with x_min, x_max, y_min, y_max required bounds
+    """
+    coords = output_grid.get_output_coordinates()
+    x_grid = coords.get('X')
+    y_grid = coords.get('Y')
+
+    if x_grid is not None and y_grid is not None:
+        # Rotated grid
+        return {
+            'x_min': float(x_grid.min()),
+            'x_max': float(x_grid.max()),
+            'y_min': float(y_grid.min()),
+            'y_max': float(y_grid.max()),
+        }
+    else:
+        # Axis-aligned grid
+        x_axis = coords['x']
+        y_axis = coords['y']
+        return {
+            'x_min': float(x_axis.min()),
+            'x_max': float(x_axis.max()),
+            'y_min': float(y_axis.min()),
+            'y_max': float(y_axis.max()),
+        }

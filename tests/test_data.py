@@ -60,6 +60,24 @@ class TestSpatialIndex:
         result = sample_index.query_radius(-10000, -10000, 10)
         assert len(result) == 0
 
+    def test_count_in_rectangle(self, sample_index):
+        """count_in_rectangle should return same count as len(query_rectangle)."""
+        count = sample_index.count_in_rectangle(400, 600, 400, 600)
+        result = sample_index.query_rectangle(400, 600, 400, 600)
+        assert count == len(result)
+
+    def test_count_in_rectangle_with_padding(self, sample_index):
+        """count_in_rectangle should respect padding parameter."""
+        count_no_pad = sample_index.count_in_rectangle(400, 600, 400, 600, padding=0)
+        count_with_pad = sample_index.count_in_rectangle(400, 600, 400, 600, padding=50)
+        # Larger area should have >= traces
+        assert count_with_pad >= count_no_pad
+
+    def test_count_empty_rectangle(self, sample_index):
+        """count_in_rectangle should return 0 for empty region."""
+        count = sample_index.count_in_rectangle(-10000, -9000, -10000, -9000)
+        assert count == 0
+
 
 class TestVelocityModels:
     """Tests for velocity models."""

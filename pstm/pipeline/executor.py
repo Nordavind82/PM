@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -184,6 +185,7 @@ from pstm.data import (
     query_traces_for_tile,
 )
 from pstm.data.velocity_model import VelocityManager, create_velocity_manager
+from pstm.data.trace_cache import LRUTraceCache
 from pstm.kernels.base import (
     KernelConfig,
     KernelMetrics,
@@ -288,6 +290,16 @@ class ProgressInfo:
 ProgressCallback = Callable[[ProgressInfo], None]
 
 
+@dataclass
+class PrefetchedTileData:
+    """Pre-fetched trace and geometry data for a tile."""
+    tile_id: int
+    trace_data: NDArray[np.float32] | None = None
+    geometry: Any | None = None  # TraceGeometry
+    trace_indices: NDArray[np.int64] | None = None
+    error: str | None = None
+
+
 class MigrationExecutor:
     """
     Main executor for 3D PSTM migration.
@@ -351,6 +363,12 @@ class MigrationExecutor:
         self._memmap_manager: MemmapManager | None = None
         self._checkpoint: CheckpointHandler | None = None
         self._tile_plan: TilePlan | None = None
+
+        # Trace cache for reducing redundant Zarr reads
+        # Use 15% of max memory, capped at 2GB
+        cache_size_mb = config.execution.resources.max_memory_gb * 1000 * 0.15
+        self._trace_cache = LRUTraceCache(max_size_mb=min(cache_size_mb, 2000))
+        self._debug.info(f"  Trace cache: {min(cache_size_mb, 2000):.0f} MB max")
 
         # Control flags
         self._pause_requested = False
@@ -754,8 +772,13 @@ class MigrationExecutor:
             apply_obliquity=self.config.algorithm.amplitude.obliquity_factor,
             interpolation_method=self.config.algorithm.interpolation.value,
             output_dt_ms=self.config.output.grid.dt_ms,
+            # Anti-aliasing config - use algorithm config if set, otherwise default to False
+            aa_enabled=self.config.algorithm.anti_aliasing.enabled if self.config.algorithm.anti_aliasing else False,
+            # Grid bin spacing for AA filter (use actual bin size, not linspace-derived)
+            grid_dx=self.config.output.grid.dx,
+            grid_dy=self.config.output.grid.dy,
         )
-        self._debug.debug(f"Kernel config: aperture={kernel_config.max_aperture_m}m, dip={kernel_config.max_dip_degrees}deg")
+        self._debug.debug(f"Kernel config: aperture={kernel_config.max_aperture_m}m, dip={kernel_config.max_dip_degrees}deg, aa_enabled={kernel_config.aa_enabled}, grid_dx={kernel_config.grid_dx}m, grid_dy={kernel_config.grid_dy}m")
         self._kernel.initialize(kernel_config)
         self._debug.info("Kernel initialized successfully")
 
@@ -807,7 +830,7 @@ class MigrationExecutor:
                 )
                 self._memmap_manager.create(
                     f"fold_bin_{bid}",
-                    shape=(grid.nx, grid.ny),
+                    shape=(grid.nx, grid.ny, grid.nt),  # 3D fold per sample
                     dtype=np.int32,
                     fill_value=0,
                 )
@@ -845,7 +868,7 @@ class MigrationExecutor:
             )
             self._memmap_manager.create(
                 "fold",
-                shape=(grid.nx, grid.ny),
+                shape=(grid.nx, grid.ny, grid.nt),  # 3D fold per sample
                 dtype=np.int32,
                 fill_value=0,
             )
@@ -1001,6 +1024,11 @@ class MigrationExecutor:
             apply_obliquity=self.config.algorithm.amplitude.obliquity_factor,
             interpolation_method=self.config.algorithm.interpolation.value,
             output_dt_ms=self.config.output.grid.dt_ms,
+            # Anti-aliasing config - use algorithm config if set, otherwise default to False
+            aa_enabled=self.config.algorithm.anti_aliasing.enabled if self.config.algorithm.anti_aliasing else False,
+            # Grid bin spacing for AA filter (use actual bin size, not linspace-derived)
+            grid_dx=self.config.output.grid.dx,
+            grid_dy=self.config.output.grid.dy,
             # Kernel type selection
             kernel_type=self.config.algorithm.kernel_type.value,
             # Curved ray parameters
@@ -1136,72 +1164,141 @@ class MigrationExecutor:
         self._debug.info(f"[APERTURE] Total input traces in dataset: {total_input_traces:,}")
         self._debug.info(f"[APERTURE] Dataset size (approx): {dataset_size_mb:.1f} MB")
 
-        # Process tiles
-        for tile in iter_tiles(self._tile_plan, completed):
-            # Check control flags
-            if self._stop_requested:
-                logger.info("Stop requested, saving checkpoint...")
-                break
-
-            if self._pause_requested:
-                logger.info("Pause requested, saving checkpoint...")
-                self._save_checkpoint()
-                self._pause_requested = False
-                # In a real implementation, we'd wait here
-                # For now, just continue
-
-            # Process single tile (reports progress with trace count)
-            metrics, tile_trace_count, tile_data_mb, tile_trace_indices = self._process_tile(
-                tile, image, fold, trace_count, offset_sum, azimuth_sin_sum, azimuth_cos_sum,
-                kernel_config, grid, offset_min, offset_max,
-                ovt_x_min, ovt_x_max, ovt_y_min, ovt_y_max,
+        # PRE-COMPUTE tile-trace mappings for all tiles (optimization)
+        # This avoids repeated spatial queries during the tile loop
+        self._debug.info("Pre-computing tile-trace mappings...")
+        t0_precompute = time.time()
+        tile_query_cache: dict[int, TileQueryResult] = {}
+        for tile in self._tile_plan.tiles:
+            query_result = query_traces_for_tile(
+                self._spatial_index,
+                tile.x_min,
+                tile.x_max,
+                tile.y_min,
+                tile.y_max,
+                kernel_config.max_aperture_m,
             )
+            tile_query_cache[tile.tile_id] = query_result
+        t_precompute = time.time() - t0_precompute
 
-            # Track aperture efficiency
-            traces_per_tile_list.append(tile_trace_count)
-            total_trace_data_loaded_mb += tile_data_mb
-            # Disabled to save memory: unique_trace_indices.update(tile_trace_indices)
+        # Analyze overlap for efficiency reporting
+        all_trace_sets = [set(q.trace_indices.tolist()) for q in tile_query_cache.values() if q.n_traces > 0]
+        if all_trace_sets:
+            unique_traces = set.union(*all_trace_sets)
+            total_trace_refs = sum(len(s) for s in all_trace_sets)
+            overlap_factor = total_trace_refs / len(unique_traces) if unique_traces else 1.0
+            self._debug.info(f"[PRE-COMPUTE] Completed in {t_precompute:.2f}s")
+            self._debug.info(f"[PRE-COMPUTE] Unique traces across all tiles: {len(unique_traces):,}")
+            self._debug.info(f"[PRE-COMPUTE] Overlap factor: {overlap_factor:.2f}x (higher = more cache benefit)")
+        else:
+            self._debug.info(f"[PRE-COMPUTE] Completed in {t_precompute:.2f}s (no traces found)")
 
-            # Update metrics
-            self.metrics.n_tiles_completed += 1
-            self.metrics.n_traces_processed += metrics.n_traces_processed
-            # Track output bins completed (tile.nx * tile.ny pillars fully migrated)
-            self.metrics.n_output_bins_completed += tile.nx * tile.ny
+        # Process tiles with async prefetching
+        # Convert to list for indexed access (needed for look-ahead prefetching)
+        tiles_to_process = list(iter_tiles(self._tile_plan, completed))
+        n_tiles = len(tiles_to_process)
+        self._debug.info(f"[PREFETCH] Enabled - will prefetch next tile while GPU processes current")
 
-            # Report completion of this tile
-            self._report_progress(
-                current=self.metrics.n_tiles_completed,  # Now 1-indexed after increment
-                total=self._tile_plan.n_tiles,
-                message=f"Completed tile {tile.tile_id + 1}/{self._tile_plan.n_tiles} - {self.metrics.n_output_bins_completed:,}/{self.metrics.total_output_bins:,} output bins",
-                traces_in_tile=0,  # Tile is done
-                tile_x=0,
-                tile_y=0,
-            )
-            self.metrics.compute_time_total += metrics.compute_time_s
+        # Use ThreadPoolExecutor for background I/O (1 thread is sufficient for prefetching)
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as prefetch_executor:
+            # Track the current prefetch future
+            prefetch_future: Future[PrefetchedTileData] | None = None
+            prefetched_data: PrefetchedTileData | None = None
 
-            # Explicit memory cleanup after each tile
-            del tile_trace_indices
-            import gc
-            gc.collect()
+            for tile_idx, tile in enumerate(tiles_to_process):
+                # Check control flags
+                if self._stop_requested:
+                    logger.info("Stop requested, saving checkpoint...")
+                    break
 
-            # Mark completed
-            self._checkpoint.mark_completed(
-                tile.tile_id,
-                n_traces=metrics.n_traces_processed,
-                compute_time=metrics.compute_time_s,
-            )
+                if self._pause_requested:
+                    logger.info("Pause requested, saving checkpoint...")
+                    self._save_checkpoint()
+                    self._pause_requested = False
+                    # In a real implementation, we'd wait here
+                    # For now, just continue
 
-            # Periodic checkpoint
-            if should_checkpoint(tile.tile_id, checkpoint_interval):
-                self._save_checkpoint()
+                # Wait for prefetched data from previous iteration (if any)
+                if prefetch_future is not None:
+                    try:
+                        prefetched_data = prefetch_future.result(timeout=60.0)
+                        if prefetched_data.error:
+                            self._debug.warning(f"  [PREFETCH] Error: {prefetched_data.error}, falling back to sync load")
+                            prefetched_data = None
+                    except Exception as e:
+                        self._debug.warning(f"  [PREFETCH] Failed to get result: {e}, falling back to sync load")
+                        prefetched_data = None
+                    prefetch_future = None
 
-            # Log progress
-            if (tile.tile_id + 1) % 10 == 0:
-                eta = self.metrics.estimate_remaining_time()
-                logger.info(
-                    f"Progress: {self.metrics.n_tiles_completed}/{self._tile_plan.n_tiles} tiles, "
-                    f"ETA: {format_duration(eta)}"
+                # Start prefetching NEXT tile's data (if there is a next tile)
+                if tile_idx + 1 < n_tiles:
+                    next_tile = tiles_to_process[tile_idx + 1]
+                    next_query = tile_query_cache.get(next_tile.tile_id)
+                    if next_query and next_query.n_traces > 0:
+                        # Submit prefetch job for next tile (runs in background during GPU processing)
+                        prefetch_future = prefetch_executor.submit(
+                            self._prefetch_tile_data,
+                            next_tile.tile_id,
+                            next_query.trace_indices,
+                        )
+
+                # Process current tile (GPU-bound) while prefetch runs in background
+                precomputed_query = tile_query_cache.get(tile.tile_id)
+                metrics, tile_trace_count, tile_data_mb, tile_trace_indices = self._process_tile(
+                    tile, image, fold, trace_count, offset_sum, azimuth_sin_sum, azimuth_cos_sum,
+                    kernel_config, grid, offset_min, offset_max,
+                    ovt_x_min, ovt_x_max, ovt_y_min, ovt_y_max,
+                    precomputed_query=precomputed_query,
+                    prefetched_data=prefetched_data,
                 )
+                # Clear prefetched data after use
+                prefetched_data = None
+
+                # Track aperture efficiency
+                traces_per_tile_list.append(tile_trace_count)
+                total_trace_data_loaded_mb += tile_data_mb
+                # Disabled to save memory: unique_trace_indices.update(tile_trace_indices)
+
+                # Update metrics
+                self.metrics.n_tiles_completed += 1
+                self.metrics.n_traces_processed += metrics.n_traces_processed
+                # Track output bins completed (tile.nx * tile.ny pillars fully migrated)
+                self.metrics.n_output_bins_completed += tile.nx * tile.ny
+
+                # Report completion of this tile
+                self._report_progress(
+                    current=self.metrics.n_tiles_completed,  # Now 1-indexed after increment
+                    total=self._tile_plan.n_tiles,
+                    message=f"Completed tile {tile.tile_id + 1}/{self._tile_plan.n_tiles} - {self.metrics.n_output_bins_completed:,}/{self.metrics.total_output_bins:,} output bins",
+                    traces_in_tile=0,  # Tile is done
+                    tile_x=0,
+                    tile_y=0,
+                )
+                self.metrics.compute_time_total += metrics.compute_time_s
+
+                # Explicit memory cleanup after each tile
+                del tile_trace_indices
+                import gc
+                gc.collect()
+
+                # Mark completed
+                self._checkpoint.mark_completed(
+                    tile.tile_id,
+                    n_traces=metrics.n_traces_processed,
+                    compute_time=metrics.compute_time_s,
+                )
+
+                # Periodic checkpoint
+                if should_checkpoint(tile.tile_id, checkpoint_interval):
+                    self._save_checkpoint()
+
+                # Log progress
+                if (tile.tile_id + 1) % 10 == 0:
+                    eta = self.metrics.estimate_remaining_time()
+                    logger.info(
+                        f"Progress: {self.metrics.n_tiles_completed}/{self._tile_plan.n_tiles} tiles, "
+                        f"ETA: {format_duration(eta)}"
+                    )
 
         # Final checkpoint
         self._save_checkpoint()
@@ -1260,6 +1357,43 @@ class MigrationExecutor:
         print(f"  Unique traces: ~{unique_count:,}/{total_input_traces:,} (estimated)", file=sys.stderr, flush=True)
         print(f"{'='*60}\n", file=sys.stderr, flush=True)
 
+    def _prefetch_tile_data(
+        self,
+        tile_id: int,
+        trace_indices: NDArray[np.int64],
+    ) -> PrefetchedTileData:
+        """
+        Prefetch trace data and geometry for a tile (runs in background thread).
+
+        This method is designed to run concurrently while the GPU processes the
+        current tile, hiding I/O latency.
+
+        Args:
+            tile_id: ID of the tile to prefetch
+            trace_indices: Indices of traces to load
+
+        Returns:
+            PrefetchedTileData with loaded trace data and geometry
+        """
+        try:
+            # Load traces using cache (thread-safe via GIL for dict operations)
+            trace_data = self._trace_cache.get_traces(trace_indices, self._trace_reader)
+
+            # Load geometry
+            geometry = self._header_manager.get_geometry_for_indices(trace_indices)
+
+            return PrefetchedTileData(
+                tile_id=tile_id,
+                trace_data=trace_data,
+                geometry=geometry,
+                trace_indices=trace_indices,
+            )
+        except Exception as e:
+            return PrefetchedTileData(
+                tile_id=tile_id,
+                error=str(e),
+            )
+
     def _process_tile(
         self,
         tile: TileSpec,
@@ -1277,6 +1411,8 @@ class MigrationExecutor:
         ovt_x_max: float | None = None,
         ovt_y_min: float | None = None,
         ovt_y_max: float | None = None,
+        precomputed_query: TileQueryResult | None = None,
+        prefetched_data: PrefetchedTileData | None = None,
     ) -> tuple[KernelMetrics, int, float, list[int]]:
         """
         Process a single tile.
@@ -1288,6 +1424,8 @@ class MigrationExecutor:
             ovt_x_max: If provided, only include traces with offset_x <= ovt_x_max
             ovt_y_min: If provided, only include traces with offset_y >= ovt_y_min
             ovt_y_max: If provided, only include traces with offset_y <= ovt_y_max
+            precomputed_query: Pre-computed tile query result (avoids spatial query)
+            prefetched_data: Pre-loaded trace data and geometry (from async prefetch)
 
         Returns:
             Tuple of (metrics, tile_trace_count, tile_data_mb, tile_trace_indices):
@@ -1335,18 +1473,23 @@ class MigrationExecutor:
         assert self._velocity_manager is not None
         assert self._kernel is not None
 
-        # Query traces in aperture
+        # Query traces in aperture (use pre-computed if available)
         t0 = time.time()
-        query_result = query_traces_for_tile(
-            self._spatial_index,
-            tile.x_min,
-            tile.x_max,
-            tile.y_min,
-            tile.y_max,
-            kernel_config.max_aperture_m,
-        )
-        t_query = time.time() - t0
-        self._debug.info(f"  [TIMING] Spatial query: {t_query:.3f}s - found {query_result.n_traces:,} traces")
+        if precomputed_query is not None:
+            query_result = precomputed_query
+            t_query = time.time() - t0
+            self._debug.info(f"  [TIMING] Spatial query (pre-computed): {t_query:.3f}s - {query_result.n_traces:,} traces")
+        else:
+            query_result = query_traces_for_tile(
+                self._spatial_index,
+                tile.x_min,
+                tile.x_max,
+                tile.y_min,
+                tile.y_max,
+                kernel_config.max_aperture_m,
+            )
+            t_query = time.time() - t0
+            self._debug.info(f"  [TIMING] Spatial query: {t_query:.3f}s - found {query_result.n_traces:,} traces")
 
         # Report progress with trace count (before heavy processing)
         # Use tile_id (0-indexed) as current to show we're WORKING on this tile, not done
@@ -1437,28 +1580,42 @@ class MigrationExecutor:
             )
 
             # Now load ONLY the matching trace data (the expensive operation)
+            # Use cache to avoid redundant reads for overlapping tile apertures
             t0 = time.time()
-            trace_data = self._trace_reader.get_traces(filtered_indices)
+            trace_data = self._trace_cache.get_traces(filtered_indices, self._trace_reader)
             t_trace_load = time.time() - t0
             trace_data_mb = trace_data.nbytes / 1024**2
-            self._debug.info(f"  [TIMING] Trace data load (post-filter): {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB)")
+            cache_stats = self._trace_cache.get_stats()
+            self._debug.info(f"  [TIMING] Trace data load (post-filter): {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB) [cache hit: {cache_stats['hit_rate']:.1%}]")
 
         else:
             # STANDARD PATH: No gather filtering needed, load in original order
-            # Load trace data
-            log_memory_state(self._debug, f"tile_{tile.tile_id}_before_trace_load")
-            t0 = time.time()
-            trace_data = self._trace_reader.get_traces(query_result.trace_indices)
-            t_trace_load = time.time() - t0
-            trace_data_mb = trace_data.nbytes / 1024**2
-            self._debug.info(f"  [TIMING] Trace data load: {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB)")
-            log_memory_state(self._debug, f"tile_{tile.tile_id}_after_trace_load")
+            # Check if we have prefetched data
+            if prefetched_data is not None and prefetched_data.trace_data is not None and prefetched_data.error is None:
+                # Use prefetched data (loaded in background while previous tile was processing)
+                t0 = time.time()
+                trace_data = prefetched_data.trace_data
+                geometry = prefetched_data.geometry
+                t_trace_load = time.time() - t0
+                t_geom_load = 0.0  # Geometry was loaded with traces in prefetch
+                trace_data_mb = trace_data.nbytes / 1024**2
+                self._debug.info(f"  [TIMING] Using PREFETCHED data: {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB) [PREFETCH HIT]")
+            else:
+                # Use cache to avoid redundant reads for overlapping tile apertures
+                log_memory_state(self._debug, f"tile_{tile.tile_id}_before_trace_load")
+                t0 = time.time()
+                trace_data = self._trace_cache.get_traces(query_result.trace_indices, self._trace_reader)
+                t_trace_load = time.time() - t0
+                trace_data_mb = trace_data.nbytes / 1024**2
+                cache_stats = self._trace_cache.get_stats()
+                self._debug.info(f"  [TIMING] Trace data load: {t_trace_load:.3f}s - {trace_data.shape} ({trace_data_mb:.1f} MB) [cache hit: {cache_stats['hit_rate']:.1%}]")
+                log_memory_state(self._debug, f"tile_{tile.tile_id}_after_trace_load")
 
-            # Load geometry
-            t0 = time.time()
-            geometry = self._header_manager.get_geometry_for_indices(query_result.trace_indices)
-            t_geom_load = time.time() - t0
-            self._debug.info(f"  [TIMING] Geometry load: {t_geom_load:.3f}s")
+                # Load geometry
+                t0 = time.time()
+                geometry = self._header_manager.get_geometry_for_indices(query_result.trace_indices)
+                t_geom_load = time.time() - t0
+                self._debug.info(f"  [TIMING] Geometry load: {t_geom_load:.3f}s")
 
         # Create trace block
         traces = create_trace_block(
@@ -1488,7 +1645,7 @@ class MigrationExecutor:
 
         output_tile = OutputTile(
             image=np.zeros((tile.nx, tile.ny, grid.nt), dtype=np.float64),
-            fold=np.zeros((tile.nx, tile.ny), dtype=np.int32),
+            fold=np.zeros((tile.nx, tile.ny, grid.nt), dtype=np.int32),  # 3D fold per sample
             x_axis=np.linspace(tile.x_min, tile.x_max, tile.nx),
             y_axis=np.linspace(tile.y_min, tile.y_max, tile.ny),
             t_axis_ms=np.arange(grid.t_min_ms, grid.t_max_ms + grid.dt_ms / 2, grid.dt_ms),
@@ -1617,7 +1774,7 @@ class MigrationExecutor:
         # Accumulate to output
         t0 = time.time()
         image[tile.x_start:tile.x_end, tile.y_start:tile.y_end, :] += output_tile.image
-        fold[tile.x_start:tile.x_end, tile.y_start:tile.y_end] += output_tile.fold
+        fold[tile.x_start:tile.x_end, tile.y_start:tile.y_end, :] += output_tile.fold  # 3D fold
 
         # Accumulate header values (offset, azimuth) per output bin
         # This enables later resort to CIG (common offset, common angle, etc.)
@@ -1894,18 +2051,14 @@ class MigrationExecutor:
         self._debug.info(f"IMAGE DEBUG (before norm): NaN count: {np.count_nonzero(np.isnan(image))}")
         self._debug.info(f"IMAGE DEBUG (before norm): Inf count: {np.count_nonzero(np.isinf(image))}")
 
-        # Normalize by fold (skip if fold is all zeros - e.g., Metal C++ 3D kernels don't track fold)
-        fold_3d = fold[:, :, np.newaxis]
-        if np.any(fold > 0):
-            self._debug.info("FOLD DEBUG: Normalizing by fold (fold > 0 detected)")
-            with np.errstate(invalid="ignore", divide="ignore"):
-                image_normalized = np.where(fold_3d > 0, image / fold_3d, 0.0)
-            self._debug.info(f"IMAGE DEBUG (after norm): min={image_normalized.min():.6f}, max={image_normalized.max():.6f}, mean={image_normalized.mean():.6f}")
-        else:
-            # No fold data - use raw image (already accumulated)
-            logger.warning("Fold is all zeros - skipping normalization (using raw stacked image)")
-            self._debug.warning("FOLD DEBUG: Fold is all zeros! Using raw accumulated image without normalization")
-            image_normalized = image
+        # Kirchhoff migration output: DO NOT normalize by fold
+        # The Kirchhoff integral sum is the correct physical quantity.
+        # Dividing by fold (~40,000 traces) would reduce amplitudes to ~1e-5 level.
+        # Fold is saved separately for QC purposes.
+        self._debug.info("FOLD DEBUG: Using Kirchhoff sum (no fold normalization)")
+        self._debug.info(f"  Fold stats: min={fold.min()}, max={fold.max()}, mean={fold.mean():.1f}")
+        image_normalized = image
+        self._debug.info(f"IMAGE DEBUG (Kirchhoff sum): min={image_normalized.min():.6f}, max={image_normalized.max():.6f}, mean={image_normalized.mean():.6f}")
 
         logger.info("Writing output files...")
 
@@ -1999,11 +2152,10 @@ class MigrationExecutor:
             azimuth_sin_sum = self._memmap_manager.get(f"azimuth_sin_sum_bin_{bid}")
             azimuth_cos_sum = self._memmap_manager.get(f"azimuth_cos_sum_bin_{bid}")
 
-            # Normalize by fold
-            fold_3d = fold[:, :, np.newaxis]
+            # Normalize by per-sample fold (3D fold)
             if np.any(fold > 0):
                 with np.errstate(invalid="ignore", divide="ignore"):
-                    image_normalized = np.where(fold_3d > 0, image / fold_3d, 0.0)
+                    image_normalized = np.where(fold > 0, image / fold, 0.0)
             else:
                 image_normalized = image
 

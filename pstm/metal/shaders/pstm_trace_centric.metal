@@ -121,7 +121,7 @@ kernel void pstm_migrate_trace_centric(
 
     // Output arrays (atomic for concurrent writes)
     device atomic_float* image [[buffer(7)]],          // [nx, ny, nt]
-    device atomic_int* fold [[buffer(8)]],             // [nx, ny]
+    device atomic_int* fold [[buffer(8)]],             // [nx, ny, nt] - 3D fold per sample
 
     // Pre-computed time-dependent values
     device const float* t0_half_sq [[buffer(9)]],      // [nt] - (t0/2)^2
@@ -165,11 +165,6 @@ kernel void pstm_migrate_trace_centric(
     if (ix_max < 0 || ix_min >= params.nx || iy_max < 0 || iy_min >= params.ny) {
         return;
     }
-
-    // Track if we contributed to any output point (for fold counting)
-    bool contributed = false;
-    int contribution_ix = 0;
-    int contribution_iy = 0;
 
     // Loop over output points in the aperture region
     for (int ix = ix_min; ix <= ix_max; ix++) {
@@ -226,21 +221,12 @@ kernel void pstm_migrate_trace_centric(
                     amp *= t0_val / t_travel;
                 }
 
-                // Atomic add to output image
-                int img_idx = ix * params.ny * params.nt + iy * params.nt + it;
-                atomic_add_float(&image[img_idx], amp);
-
-                contributed = true;
-                contribution_ix = ix;
-                contribution_iy = iy;
+                // Atomic add to output image and fold (3D fold - count per sample)
+                int idx = ix * params.ny * params.nt + iy * params.nt + it;
+                atomic_add_float(&image[idx], amp);
+                atomic_fetch_add_explicit(&fold[idx], 1, memory_order_relaxed);
             }
         }
-    }
-
-    // Update fold count (once per trace that contributed)
-    if (contributed) {
-        int fold_idx = contribution_ix * params.ny + contribution_iy;
-        atomic_fetch_add_explicit(&fold[fold_idx], 1, memory_order_relaxed);
     }
 }
 
@@ -260,7 +246,7 @@ kernel void pstm_migrate_trace_centric_v2(
 
     // Output arrays (atomic)
     device atomic_float* image [[buffer(7)]],
-    device atomic_int* fold [[buffer(8)]],
+    device atomic_int* fold [[buffer(8)]],             // [nx, ny, nt] - 3D fold per sample
 
     // Pre-computed values
     device const float* t0_half_sq [[buffer(9)]],
@@ -349,8 +335,10 @@ kernel void pstm_migrate_trace_centric_v2(
                     amp *= t0_val / t_travel;
                 }
 
-                int img_idx = ix * params.ny * params.nt + iy * params.nt + it;
-                atomic_add_float(&image[img_idx], amp);
+                // Atomic add to output image and fold (3D fold - count per sample)
+                int idx = ix * params.ny * params.nt + iy * params.nt + it;
+                atomic_add_float(&image[idx], amp);
+                atomic_fetch_add_explicit(&fold[idx], 1, memory_order_relaxed);
             }
         }
     }

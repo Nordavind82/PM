@@ -436,7 +436,7 @@ def run_cached_tile_migration(
         tile_ny = iy_end - iy_start
         output = OutputTile(
             image=np.zeros((tile_nx, tile_ny, nt), dtype=np.float64),
-            fold=np.zeros((tile_nx, tile_ny), dtype=np.int32),
+            fold=np.zeros((tile_nx, tile_ny, nt), dtype=np.int32),  # 3D fold per sample
             x_axis=x_axis[ix_start:ix_end].astype(np.float32),
             y_axis=y_axis[iy_start:iy_end].astype(np.float32),
             t_axis_ms=t_axis_ms.astype(np.float32),

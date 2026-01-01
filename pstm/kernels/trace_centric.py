@@ -409,7 +409,7 @@ class TraceCentricKernel(MigrationKernel):
 
         # Output arrays (initialized to zero)
         image_out = np.zeros((nx, ny, nt), dtype=np.float32)
-        fold_out = np.zeros((nx, ny), dtype=np.int32)
+        fold_out = np.zeros((nx, ny, nt), dtype=np.int32)  # 3D fold per sample
 
         # Create Metal buffers
         def create_buffer(arr):
@@ -514,7 +514,7 @@ class TraceCentricKernel(MigrationKernel):
         fold_data = fold_buf.contents().as_buffer(fold_out.nbytes)
 
         image_result = np.frombuffer(image_data, dtype=np.float32).reshape(nx, ny, nt)
-        fold_result = np.frombuffer(fold_data, dtype=np.int32).reshape(nx, ny)
+        fold_result = np.frombuffer(fold_data, dtype=np.int32).reshape(nx, ny, nt)  # 3D fold
 
         output.image[:] = image_result.astype(np.float64)
         output.fold[:] = fold_result

@@ -121,7 +121,7 @@ class OutputTile:
     """Output tile for migration kernel."""
 
     image: NDArray[np.float64]  # (nx, ny, nt)
-    fold: NDArray[np.int32]  # (nx, ny)
+    fold: NDArray[np.int32]  # (nx, ny, nt) - 3D fold per sample
     x_axis: NDArray[np.float64]  # 1D inline coordinates
     y_axis: NDArray[np.float64]  # 1D crossline coordinates
     t_axis_ms: NDArray[np.float64]
@@ -231,7 +231,11 @@ class KernelConfig:
     vti_eta_constant: float = 0.0  # Constant eta value (used if eta_array is None)
     vti_eta_array: NDArray[np.float64] | None = None  # 1D eta(t) or 3D eta(x,y,t)
     vti_eta_is_1d: bool = True  # True if eta_array is 1D, False if 3D
-    
+
+    # Grid bin spacing for AA filter (actual bin size, not linspace-derived)
+    grid_dx: float = 25.0  # Inline bin size in meters
+    grid_dy: float = 12.5  # Crossline bin size in meters
+
     def __post_init__(self):
         """Apply defaults from settings."""
         from pstm.settings import get_settings
@@ -373,7 +377,7 @@ def create_output_tile(
 
     return OutputTile(
         image=np.zeros((nx, ny, nt), dtype=np.float64),
-        fold=np.zeros((nx, ny), dtype=np.int32),
+        fold=np.zeros((nx, ny, nt), dtype=np.int32),  # 3D fold per sample
         x_axis=x_axis,
         y_axis=y_axis,
         t_axis_ms=t_axis_ms,
