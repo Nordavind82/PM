@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QFrame, QDialog, QDialogButtonBox, QFormLayout,
     QMenuBar, QMenu
 )
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QSize, QSettings
 from PyQt6.QtGui import (
     QImage, QPainter, QColor, QPen, QWheelEvent, QMouseEvent,
     QKeyEvent, QPaintEvent, QFont, QFontMetrics, QBrush
@@ -780,6 +780,7 @@ class VolumePanel(QFrame):
         self.current_direction = "inline"
         self.current_index = 0
         self.slice_value = 0.0  # Current slice coordinate value
+        self.file_path: Optional[str] = None  # Loaded file path for state recovery
 
         # Coordinate arrays (optional, for proper axis values)
         self.x_coords: Optional[np.ndarray] = None  # Inline coordinates
@@ -849,6 +850,7 @@ class VolumePanel(QFrame):
 
             self.cube = data
             self.cube_shape = data.shape
+            self.file_path = path  # Store path for state recovery
 
             # Try to load coordinate arrays
             self._load_coordinates(z, path)
@@ -991,6 +993,7 @@ class GatherPanel(QFrame):
         self.gather_store = None  # Keep zarr store reference
         self.gather_shape: Tuple = ()
         self.gather_type = "cig"  # "cig" or "common_offset_folder"
+        self.file_path: Optional[str] = None  # Loaded file path for state recovery
 
         # For folder-based common offset gathers
         self.offset_bins: List[zarr.Array] = []  # List of zarr arrays per offset
@@ -1065,6 +1068,7 @@ class GatherPanel(QFrame):
     def load_zarr(self, path: str):
         """Load zarr gather data - supports both 4D zarr and folder-based common offset."""
         path = Path(path)
+        self.file_path = str(path)  # Store path for state recovery
 
         try:
             # Check for folder-based common offset gathers (has metadata.json)
@@ -2801,7 +2805,15 @@ class SeismicViewer(QMainWindow):
         # Velocity Analysis window
         self.va_window = None
 
+        # File paths for state recovery
+        self.vol1_path: str = None
+        self.vol2_path: str = None
+        self.gather_path: str = None
+
         self._setup_ui()
+
+        # Restore previous session state
+        self._restore_state()
 
     def _setup_ui(self):
         """Setup the user interface."""
@@ -3052,7 +3064,7 @@ class SeismicViewer(QMainWindow):
 
         # Update VA window position
         if self.va_window is not None and self.va_window.isVisible():
-            self.va_window.set_position(il_idx, xl_idx)
+            self.va_window.set_position(il_idx, xl_idx, auto_compute=True)
             self.statusBar().showMessage(
                 f"VA Position: IL={il_idx}, XL={xl_idx}"
             )
@@ -3065,7 +3077,8 @@ class SeismicViewer(QMainWindow):
 
     def _open_velocity_analysis(self):
         """Open Velocity Analysis window."""
-        if self.va_window is None:
+        is_new_window = self.va_window is None
+        if is_new_window:
             self.va_window = VelocityAnalysisWindow(self)
 
         # Pass gather data if available from gather panel
@@ -3075,16 +3088,22 @@ class SeismicViewer(QMainWindow):
                 self.gather_panel.offset_coords,
                 self.gather_panel.t_coords
             )
-            # Set initial position from cube center if available
-            if self.volume1.cube is not None:
-                il_center = self.volume1.cube_shape[0] // 2
-                xl_center = self.volume1.cube_shape[1] // 2
-                self.va_window.set_position(il_center, xl_center)
-            else:
-                self.va_window.set_position(
-                    self.gather_panel.current_il_idx,
-                    self.gather_panel.current_xl_idx
-                )
+
+            # Restore VA state if this is a new window
+            if is_new_window:
+                self._restore_va_state()
+
+            # Set initial position from cube center if available (only if not restored)
+            if is_new_window and self.va_window.il_center == 0 and self.va_window.xl_center == 0:
+                if self.volume1.cube is not None:
+                    il_center = self.volume1.cube_shape[0] // 2
+                    xl_center = self.volume1.cube_shape[1] // 2
+                    self.va_window.set_position(il_center, xl_center)
+                else:
+                    self.va_window.set_position(
+                        self.gather_panel.current_il_idx,
+                        self.gather_panel.current_xl_idx
+                    )
         else:
             self.statusBar().showMessage("Load gathers in VA window or use gather panel first")
 
@@ -3232,6 +3251,297 @@ class SeismicViewer(QMainWindow):
         else:
             self.gather_panel.type_combo.setCurrentIndex(0)
 
+    # =========================================================================
+    # State Persistence
+    # =========================================================================
+
+    def _save_state(self):
+        """Save application state for recovery on next launch."""
+        settings = QSettings("PSTM", "SeismicViewer")
+
+        print(f"[DEBUG] _save_state called, settings file: {settings.fileName()}")
+
+        # File paths - get from panels
+        vol1_path = self.volume1.file_path if self.volume1.file_path else ""
+        vol2_path = self.volume2.file_path if self.volume2.file_path else ""
+        gather_path = self.gather_panel.file_path if self.gather_panel.file_path else ""
+
+        print(f"[DEBUG] Saving paths: vol1={vol1_path}, vol2={vol2_path}, gather={gather_path}")
+
+        settings.setValue("vol1_path", vol1_path)
+        settings.setValue("vol2_path", vol2_path)
+        settings.setValue("gather_path", gather_path)
+
+        # View mode
+        settings.setValue("view_mode", self.view_mode)
+        settings.setValue("sync_enabled", self.sync_enabled)
+
+        # Navigation
+        settings.setValue("direction", self.direction_combo.currentIndex())
+        settings.setValue("slice_index", self.slice_spin.value())
+        settings.setValue("step_size", self.step_spin.value())
+
+        # Display settings
+        settings.setValue("palette", self.palette_combo.currentText())
+        settings.setValue("gain", self.gain_spin.value())
+        settings.setValue("clip", self.clip_spin.value())
+
+        # Volume 1 position
+        if self.volume1.cube is not None:
+            settings.setValue("vol1_direction", self.volume1.current_direction)
+            settings.setValue("vol1_index", self.volume1.current_index)
+
+        # Volume 2 position
+        if self.volume2.cube is not None:
+            settings.setValue("vol2_direction", self.volume2.current_direction)
+            settings.setValue("vol2_index", self.volume2.current_index)
+
+        # Gather position
+        if self.gather_panel.gather_data is not None or len(self.gather_panel.offset_bins) > 0:
+            settings.setValue("gather_il", self.gather_panel.current_il_idx)
+            settings.setValue("gather_xl", self.gather_panel.current_xl_idx)
+            settings.setValue("gather_type", self.gather_panel.gather_type)
+
+        # VA window state (if exists)
+        if self.va_window is not None:
+            self._save_va_state(settings)
+
+        # Ensure settings are written to disk
+        settings.sync()
+
+    def _save_va_state(self, settings: QSettings):
+        """Save Velocity Analysis window state."""
+        va = self.va_window
+        settings.beginGroup("VA")
+
+        # Position
+        settings.setValue("il_center", va.il_center)
+        settings.setValue("xl_center", va.xl_center)
+
+        # Super gather params
+        settings.setValue("il_window", va.il_spin.value())
+        settings.setValue("xl_window", va.xl_spin.value())
+        settings.setValue("offset_bin", va.offset_spin.value())
+
+        # Mute params
+        settings.setValue("top_mute", va.top_mute_check.isChecked())
+        settings.setValue("v_top", va.vtop_spin.value())
+        settings.setValue("bottom_mute", va.bottom_mute_check.isChecked())
+        settings.setValue("v_bottom", va.vbot_spin.value())
+
+        # Processing params
+        settings.setValue("inv_nmo", va.inv_nmo_check.isChecked())
+        settings.setValue("v_nmo", va.vnmo_spin.value())
+        settings.setValue("bandpass", va.bp_check.isChecked())
+        settings.setValue("f_low", va.f_low_spin.value())
+        settings.setValue("f_high", va.f_high_spin.value())
+        settings.setValue("agc", va.agc_check.isChecked())
+        settings.setValue("agc_window", va.agc_spin.value())
+
+        # Semblance params
+        settings.setValue("v_min", va.v_min)
+        settings.setValue("v_max", va.v_max)
+        settings.setValue("v_step", va.v_step)
+        settings.setValue("semblance_window", va.semblance_window_samples)
+
+        # Display settings
+        settings.setValue("gather_colormap", va.gather_colormap)
+        settings.setValue("gather_clip", va.gather_clip)
+        settings.setValue("gather_gain", va.gather_gain)
+        settings.setValue("semblance_colormap", va.semblance_colormap)
+        settings.setValue("semblance_clip", va.semblance_clip)
+
+        settings.endGroup()
+
+    def _restore_state(self):
+        """Restore application state from previous session."""
+        settings = QSettings("PSTM", "SeismicViewer")
+
+        print(f"[DEBUG] _restore_state called, settings file: {settings.fileName()}")
+        print(f"[DEBUG] All keys: {settings.allKeys()}")
+
+        # Check if we have saved state
+        if not settings.contains("vol1_path"):
+            print("[DEBUG] No saved state found (vol1_path key missing)")
+            return
+
+        print("[DEBUG] Found saved state, restoring...")
+
+        try:
+            # Restore display settings first (before loading data)
+            palette = settings.value("palette", "Gray")
+            idx = self.palette_combo.findText(palette)
+            if idx >= 0:
+                self.palette_combo.setCurrentIndex(idx)
+
+            gain = settings.value("gain", 1.0)
+            self.gain_spin.setValue(float(gain) if gain else 1.0)
+
+            clip = settings.value("clip", 99.0)
+            self.clip_spin.setValue(float(clip) if clip else 99.0)
+
+            step = settings.value("step_size", 1)
+            self.step_spin.setValue(int(step) if step else 1)
+
+            # Load volume 1
+            vol1_path = settings.value("vol1_path", "")
+            if vol1_path and Path(vol1_path).exists():
+                self.volume1.load_zarr(vol1_path)
+                # Restore position after load
+                direction = settings.value("vol1_direction", "inline")
+                index = settings.value("vol1_index", 0)
+                self.volume1.set_direction(direction)
+                self.volume1.set_slice_index(int(index) if index else 0)
+
+            # Load volume 2
+            vol2_path = settings.value("vol2_path", "")
+            if vol2_path and Path(vol2_path).exists():
+                self.volume2.load_zarr(vol2_path)
+                direction = settings.value("vol2_direction", "inline")
+                index = settings.value("vol2_index", 0)
+                self.volume2.set_direction(direction)
+                self.volume2.set_slice_index(int(index) if index else 0)
+
+            # Load gathers
+            gather_path = settings.value("gather_path", "")
+            if gather_path and Path(gather_path).exists():
+                self.gather_panel.load_zarr(gather_path)
+                # Restore position
+                il = settings.value("gather_il", 0)
+                xl = settings.value("gather_xl", 0)
+                self.gather_panel.set_position(int(il) if il else 0, int(xl) if xl else 0)
+
+            # Restore navigation
+            direction_idx = settings.value("direction", 0)
+            self.direction_combo.setCurrentIndex(int(direction_idx) if direction_idx else 0)
+
+            slice_idx = settings.value("slice_index", 0)
+            if self.volume1.cube is not None:
+                max_idx = self._get_max_slice_index()
+                idx = min(int(slice_idx) if slice_idx else 0, max_idx)
+                self.slice_spin.setValue(idx)
+
+            # Restore view mode
+            view_mode = settings.value("view_mode", "single")
+            modes = ["single", "dual", "velocity_analysis"]
+            if view_mode in modes:
+                idx = modes.index(view_mode)
+                self.mode_combo.setCurrentIndex(idx)
+
+            # Restore sync
+            sync = settings.value("sync_enabled", True)
+            self.sync_check.setChecked(sync == True or sync == "true")
+
+            self.statusBar().showMessage("Session restored")
+
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to restore session: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _restore_va_state(self):
+        """Restore Velocity Analysis window state."""
+        settings = QSettings("PSTM", "SeismicViewer")
+
+        if not settings.childGroups() or "VA" not in settings.childGroups():
+            return
+
+        settings.beginGroup("VA")
+
+        va = self.va_window
+
+        # Position
+        il = settings.value("il_center", va.il_center)
+        xl = settings.value("xl_center", va.xl_center)
+        va.il_center = int(il) if il else va.il_center
+        va.xl_center = int(xl) if xl else va.xl_center
+
+        # Super gather params
+        il_win = settings.value("il_window", 5)
+        va.il_spin.setValue(int(il_win) if il_win else 5)
+        xl_win = settings.value("xl_window", 5)
+        va.xl_spin.setValue(int(xl_win) if xl_win else 5)
+        off_bin = settings.value("offset_bin", 50)
+        va.offset_spin.setValue(int(off_bin) if off_bin else 50)
+
+        # Mute params
+        top_mute = settings.value("top_mute", False)
+        va.top_mute_check.setChecked(top_mute == True or top_mute == "true")
+        v_top = settings.value("v_top", 1500)
+        va.vtop_spin.setValue(int(v_top) if v_top else 1500)
+        bottom_mute = settings.value("bottom_mute", False)
+        va.bottom_mute_check.setChecked(bottom_mute == True or bottom_mute == "true")
+        v_bottom = settings.value("v_bottom", 4000)
+        va.vbot_spin.setValue(int(v_bottom) if v_bottom else 4000)
+
+        # Processing params
+        inv_nmo = settings.value("inv_nmo", False)
+        va.inv_nmo_check.setChecked(inv_nmo == True or inv_nmo == "true")
+        v_nmo = settings.value("v_nmo", 2500)
+        va.vnmo_spin.setValue(int(v_nmo) if v_nmo else 2500)
+        bandpass = settings.value("bandpass", False)
+        va.bp_check.setChecked(bandpass == True or bandpass == "true")
+        f_low = settings.value("f_low", 5)
+        va.f_low_spin.setValue(int(f_low) if f_low else 5)
+        f_high = settings.value("f_high", 80)
+        va.f_high_spin.setValue(int(f_high) if f_high else 80)
+        agc = settings.value("agc", False)
+        va.agc_check.setChecked(agc == True or agc == "true")
+        agc_window = settings.value("agc_window", 500)
+        va.agc_spin.setValue(int(agc_window) if agc_window else 500)
+
+        # Semblance params
+        v_min = settings.value("v_min", 1500.0)
+        va.v_min = float(v_min) if v_min else 1500.0
+        v_max = settings.value("v_max", 5000.0)
+        va.v_max = float(v_max) if v_max else 5000.0
+        v_step = settings.value("v_step", 100.0)
+        va.v_step = float(v_step) if v_step else 100.0
+        sem_win = settings.value("semblance_window", 5)
+        va.semblance_window_samples = int(sem_win) if sem_win else 5
+
+        # Display settings
+        gather_cmap = settings.value("gather_colormap", "Seismic (BWR)")
+        va.gather_colormap = gather_cmap if gather_cmap else "Seismic (BWR)"
+        gather_clip = settings.value("gather_clip", 99.0)
+        va.gather_clip = float(gather_clip) if gather_clip else 99.0
+        gather_gain = settings.value("gather_gain", 1.0)
+        va.gather_gain = float(gather_gain) if gather_gain else 1.0
+        va.gain_spin.setValue(va.gather_gain)
+        sem_cmap = settings.value("semblance_colormap", "Viridis")
+        va.semblance_colormap = sem_cmap if sem_cmap else "Viridis"
+        sem_clip = settings.value("semblance_clip", 99.0)
+        va.semblance_clip = float(sem_clip) if sem_clip else 99.0
+
+        settings.endGroup()
+
+        # Update position display
+        va.pos_label.setText(f"IL={va.il_center}, XL={va.xl_center}")
+
+    def _get_max_slice_index(self) -> int:
+        """Get max slice index for current direction."""
+        if self.volume1.cube is None:
+            return 0
+        direction_idx = self.direction_combo.currentIndex()
+        if direction_idx == 0:
+            return self.volume1.cube_shape[0] - 1
+        elif direction_idx == 1:
+            return self.volume1.cube_shape[1] - 1
+        else:
+            return self.volume1.cube_shape[2] - 1
+
+    def closeEvent(self, event):
+        """Handle window close - save state before exit."""
+        print("[DEBUG] closeEvent called")
+        self._save_state()
+
+        # Close VA window if open
+        if self.va_window is not None:
+            self.va_window.close()
+
+        event.accept()
+        print("[DEBUG] closeEvent finished")
+
 
 # =============================================================================
 # Main
@@ -3250,6 +3560,8 @@ def main():
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
+    app.setOrganizationName("PSTM")
+    app.setApplicationName("SeismicViewer")
     app.setStyle('Fusion')
 
     # Dark theme
